@@ -325,7 +325,16 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.func
     def _task_compute_rho(self, i, j, ret: qd.template(), i_b):
-        ret += self._particle_volume * self.cubic_kernel(
+        # A boundary neighbour weighs its virtual volume, restoring the kernel weight the wall truncates for the solid
+        # particle it acts on. Fluid particles take no support from the walls.
+        volume_j = self._particle_volume
+        if qd.static(self._has_boundary_particles):
+            if self.particles_info_reordered[j, i_b].is_boundary:
+                if self.particles_info_reordered[i, i_b].is_solid:
+                    volume_j = self.particles_reordered[j, i_b].vol_vir
+                else:
+                    volume_j = gs.qd_float(0.0)
+        ret += volume_j * self.cubic_kernel(
             (self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos).norm()
         )
 
@@ -415,10 +424,24 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
     def _task_compute_stress_forces(self, i, j, ret: qd.template(), i_b: qd.i32):
         rho_i = self.particles_reordered[i, i_b].rho
         rho_j = self.particles_reordered[j, i_b].rho
+        mass_j = self.particles_info_reordered[j, i_b].mass
+        sigma_j = self.particles_reordered[j, i_b].sigma
+
+        # A boundary neighbour acts through the solid particle it faces: it borrows that particle's rest density and
+        # brings its own virtual volume and stress. Fluid particles take no support from the walls and keep a
+        # zero-weight pair, since a boundary particle carries no mass.
+        is_boundary_j = False
+        if qd.static(self._has_boundary_particles):
+            is_boundary_j = self.particles_info_reordered[j, i_b].is_boundary
+            if is_boundary_j and self.particles_info_reordered[i, i_b].is_solid:
+                rho0_i = self.particles_info_reordered[i, i_b].rho
+                rho_j = rho0_i
+                mass_j = self.particles_reordered[j, i_b].vol_vir * rho0_i
+                sigma_j = self.particles_reordered[j, i_b].sigma_vir
 
         # Stress divergence, symmetric formula
-        ret += self.particles_info_reordered[j, i_b].mass * (
-            (self.particles_reordered[i, i_b].sigma / rho_i**2 + self.particles_reordered[j, i_b].sigma / rho_j**2)
+        ret += mass_j * (
+            (self.particles_reordered[i, i_b].sigma / rho_i**2 + sigma_j / rho_j**2)
             @ self.cubic_kernel_derivative(self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos)
         )
 
@@ -503,18 +526,25 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         x_ij = self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos
         grad_w = self.cubic_kernel_derivative(x_ij)
         vol_j = self.particles_info_reordered[j, i_b].mass / self.particles_reordered[j, i_b].rho
+        v_j = self.particles_reordered[j, i_b].vel
 
-        ret.L += vol_j * qd.Matrix.outer_product(
-            self.particles_reordered[j, i_b].vel - self.particles_reordered[i, i_b].vel, grad_w
-        )
+        is_boundary_j = False
+        if qd.static(self._has_boundary_particles):
+            is_boundary_j = self.particles_info_reordered[j, i_b].is_boundary
+            if is_boundary_j:
+                vol_j = self.particles_reordered[j, i_b].vol_vir
+                v_j = self.particles_reordered[j, i_b].vel_vir
+
+        ret.L += vol_j * qd.Matrix.outer_product(v_j - self.particles_reordered[i, i_b].vel, grad_w)
 
         # Stress diffusion term (Feng), accumulated as a stress rate. The gravity correction cancels the geostatic
         # stress difference, so the diffusion does not relax the weight of a settled column. The smoothing length is
         # the support radius, which is twice the particle size in the genesis SPH convention.
-        psi = self.particles_reordered[i, i_b].sigma - self.particles_reordered[j, i_b].sigma
-        psi += self.particles_info_reordered[i, i_b].rho * self._gravity[i_b].dot(x_ij) * ret.gravity_correction
-        eta_sq = (0.1 * self._support_radius) ** 2
-        ret.stress_diffusion_sum += psi * (x_ij.dot(grad_w) / (x_ij.norm_sqr() + eta_sq)) * vol_j
+        if not is_boundary_j:
+            psi = self.particles_reordered[i, i_b].sigma - self.particles_reordered[j, i_b].sigma
+            psi += self.particles_info_reordered[i, i_b].rho * self._gravity[i_b].dot(x_ij) * ret.gravity_correction
+            eta_sq = (0.1 * self._support_radius) ** 2
+            ret.stress_diffusion_sum += psi * (x_ij.dot(grad_w) / (x_ij.norm_sqr() + eta_sq)) * vol_j
 
     @qd.kernel
     def _kernel_compute_velocity_gradient(self, f: qd.i32):
@@ -566,6 +596,80 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                         )
                 self.particles_reordered[i_p, i_b].sigma = sigma
                 self.particles_reordered[i_p, i_b].eps_p = eps_p
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------- boundary particles ---------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @qd.func
+    def _task_extrapolate_boundary_state(self, i, j, ret: qd.template(), i_b: qd.i32):
+        if self.particles_info_reordered[j, i_b].is_solid and not self.particles_info_reordered[j, i_b].is_boundary:
+            x_ji = self.particles_reordered[j, i_b].pos - self.particles_reordered[i, i_b].pos
+            vol_j = self.particles_info_reordered[j, i_b].mass / self.particles_reordered[j, i_b].rho
+            weight = self.cubic_kernel(x_ji.norm()) * vol_j
+
+            # K0 gravity correction of the neighbour, taken at its own material and in the direction from the wall to
+            # the neighbour, so the extrapolated stress carries the geostatic increment between the two.
+            gravity = self._gravity[i_b]
+            gravity_norm_sq = gravity.norm_sqr()
+            gravity_correction = qd.Matrix.zero(gs.qd_float, 3, 3)
+            if gravity_norm_sq > 1e-12:
+                K0 = self.particles_info_reordered[j, i_b].K0
+                gravity_correction = K0 * qd.Matrix.identity(gs.qd_float, 3) + (1.0 - K0) * (
+                    qd.Matrix.outer_product(gravity, gravity) / gravity_norm_sq
+                )
+
+            ret.den += weight
+            ret.v_sum += self.particles_reordered[j, i_b].vel * weight
+            ret.sigma_sum += (
+                self.particles_reordered[j, i_b].sigma
+                + self.particles_info_reordered[j, i_b].rho * gravity.dot(x_ji) * gravity_correction
+            ) * weight
+
+    @qd.kernel
+    def _kernel_update_boundary_state(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            if self.particles_info_reordered[i_p, i_b].is_boundary:
+                ret = qd.Struct(
+                    den=gs.qd_float(0.0),
+                    v_sum=qd.Vector.zero(gs.qd_float, 3),
+                    sigma_sum=qd.Matrix.zero(gs.qd_float, 3, 3),
+                )
+                self.sh.for_all_neighbors(
+                    i_p,
+                    self.particles_reordered.pos,
+                    self._support_radius,
+                    ret,
+                    self._task_extrapolate_boundary_state,
+                    i_b,
+                )
+
+                # A boundary particle whose solid neighbourhood is negligible keeps an extrapolated state of zero.
+                shepard = gs.qd_float(1.0)
+                if ret.den > 1e-3:
+                    shepard = 1.0 / ret.den
+
+                v_ext = ret.v_sum * shepard
+                sigma_ext = ret.sigma_sum * shepard
+
+                # The wall contributes the nominal particle volume: at the lattice position of the mirror image of a
+                # solid particle, that volume restores exactly the kernel weight the wall truncates. Scaling it by the
+                # Shepard denominator instead would inflate it wherever the wall is partially covered by solids, and
+                # over-restore the density there.
+                self.particles_reordered[i_p, i_b].vol_vir = self._particle_volume
+
+                # The wall applies no return mapping, so a tensile trace would pull the adjacent material: clamp it.
+                if sigma_ext.trace() > 0.0:
+                    sigma_ext = qd.Matrix.zero(gs.qd_float, 3, 3)
+
+                normal = self.particles_info_reordered[i_p, i_b].boundary_normal
+                v_wall = self.particles_reordered[i_p, i_b].vel
+                v_vir = v_ext - 2.0 * (v_ext - v_wall).dot(normal) * normal
+                if self._boundary_friction > 0:
+                    v_vir = 2.0 * v_wall - v_ext
+
+                self.particles_reordered[i_p, i_b].vel_vir = v_vir
+                self.particles_reordered[i_p, i_b].sigma_vir = sigma_ext
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- DFSPH ----------------------------------------
@@ -911,6 +1015,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self._kernel_reorder_particles(f)
             if self._pressure_solver == "WCSPH":
                 self._kernel_compute_rho(f)
+                # The boundary sweep weights its neighbours by their density, so it follows the density kernel.
+                if self._has_boundary_particles:
+                    self._kernel_update_boundary_state(f)
                 if self._needs_stress:
                     self._kernel_compute_velocity_gradient(f)
                     self._kernel_update_stress(f)
