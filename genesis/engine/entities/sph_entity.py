@@ -76,6 +76,9 @@ class SPHEntity(ParticleEntity):
             self._material.exponent,
             self._material.mu,
             self._material.gamma,
+            self._material.K0,
+            self._material.idx,
+            self._material.is_solid,
             self._particles,
         )
 

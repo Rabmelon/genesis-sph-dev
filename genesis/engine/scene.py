@@ -400,6 +400,8 @@ class Scene(RBC):
                 gs.materials.MPM.Liquid,
                 gs.materials.MPM.Sand,
                 gs.materials.MPM.Snow,
+                gs.materials.SPH.DruckerPrager,
+                gs.materials.SPH.Elastic,
                 gs.materials.SPH.Liquid,
             ),
         ):

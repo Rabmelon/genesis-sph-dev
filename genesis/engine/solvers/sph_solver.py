@@ -9,6 +9,7 @@ from genesis.engine.boundaries import CubeBoundary
 from genesis.engine.entities import SPHEntity
 from genesis.engine.materials import SPH
 from genesis.engine.states.solvers import SPHSolverState
+from genesis.utils.misc import qd_to_numpy
 
 from .base_solver import GravityMixin, Solver, TimeBasedMixin
 
@@ -43,6 +44,11 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
         self._particle_volume = 0.8 * self._particle_size**3  # 0.8 is an empirical value
 
+        # materials
+        self._materials = list()
+        self._materials_idx = list()
+        self._materials_update_stress = list()
+
         # spatial hasher
         self.sh = gu.SpatialHasher(
             cell_size=options.hash_grid_cell_size,
@@ -71,6 +77,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             p=gs.qd_float,  # pressure
             dfsph_factor=gs.qd_float,  # DFSPH use: Factor for Divergence and density solver
             drho=gs.qd_float,  # density deritivate
+            L=gs.qd_mat3,  # velocity gradient
+            sigma=gs.qd_mat3,  # Cauchy stress, tension positive
+            eps_p=gs.qd_float,  # accumulated equivalent plastic strain
         )
 
         # dynamic particle state without gradient
@@ -87,6 +96,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             exponent=gs.qd_float,
             mu=gs.qd_float,  # viscosity
             gamma=gs.qd_float,  # surface tension
+            K0=gs.qd_float,  # lateral stress coefficient of the stress-diffusion gravity correction
+            material_idx=gs.qd_int,
+            is_solid=gs.qd_bool,
         )
 
         # single frame particle state for rendering
@@ -120,6 +132,11 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
 
+        # Stress diffusion term summed over the neighbours, read by the stress update within the same substep. It is
+        # buffered because the velocity gradient sweep reads the stress field while the stress update writes it.
+        if self._needs_stress:
+            self.stress_diffusion_sum = qd.field(gs.qd_mat3, shape=(self._n_particles, self._B), layout=qd.Layout.SOA)
+
     def init_ckpt(self):
         self._ckpt = dict()
 
@@ -136,6 +153,12 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
         self._coupler = self.sim._coupler
 
+        self._needs_stress = any(material.needs_stress for material in self._materials)
+        solid_materials = [material for material in self._materials if material.is_solid]
+
+        if self._pressure_solver == "DFSPH" and solid_materials:
+            gs.raise_exception("Solid SPH materials are only supported by the 'WCSPH' pressure solver.")
+
         if self.is_active:
             self.sh.build(self._B)
             self.init_particle_fields()
@@ -148,7 +171,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             # if the current timestep is larger than the stable timestep. This formula is derived from
             # [_task_compute_non_pressure_forces] function, which computes the acceleration due to non-pressure forces.
             stable_dt = (
-                self._stable_dt_coef * (0.01 * self._support_radius**2) / self.particles_info.mu.to_numpy().max()
+                self._stable_dt_coef
+                * (0.01 * self._support_radius**2)
+                / max(qd_to_numpy(self.particles_info.mu).max(), gs.EPS)
             )
             if self.substep_dt > stable_dt:
                 gs.logger.warning(
@@ -156,6 +181,20 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                     f"({stable_dt:.4g}) for SPH solver. "
                     "Please consider reducing the timestep, liquid viscosity (mu), or increasing the particle size."
                 )
+
+            # Compute the elastic-wave stable timestep for every solid material and warn if the current timestep
+            # exceeds it. The timestep is never adjusted automatically because the substep count is resolved once at
+            # build time from the scene options.
+            if solid_materials:
+                v_max = np.linalg.norm(qd_to_numpy(self.particles.vel), axis=-1).max()
+                elastic_dt = min(0.3 * self._support_radius / (material.c_p + v_max) for material in solid_materials)
+                if self.substep_dt > elastic_dt:
+                    gs.logger.warning(
+                        f"Current timestep ({self.substep_dt:.4g}) is larger than the elastic-wave stable timestep "
+                        f"({elastic_dt:.4g}) for SPH solid materials, computed from the P-wave speed and the "
+                        f"maximum particle velocity at build time ({v_max:.4g}). "
+                        "Please consider reducing the timestep, the Young's modulus, or increasing the particle size."
+                    )
 
             # TODO: Support per-particle density
             self._density0 = self.particles_info[0].rho
@@ -171,9 +210,23 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
     def is_active(self):
         return self.n_particles > 0
 
+    def add_material(self, material):
+        # Register material update methods if and only if the provided material is not already registered
+        for material_i in self._materials:
+            if material == material_i:
+                material.idx = material_i.idx
+                break
+        else:
+            material.idx = len(self._materials_idx)
+            self._materials_idx.append(material.idx)
+            self._materials_update_stress.append(material.update_stress)
+        self._materials.append(material)
+
     def add_entity(
         self, idx, material, morph, surface, visualize_contact=False, name: str | None = None, desc=None
     ) -> "SPHEntity":
+        self.add_material(material)
+
         entity = SPHEntity(
             scene=self.scene,
             solver=self,
@@ -314,27 +367,36 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 self.particles_reordered[i_p, i_b].acc = acc
 
     @qd.func
-    def _task_compute_pressure_forces(self, i, j, ret: qd.template(), i_b):
-        dp_i = self.particles_reordered[i, i_b].p / self.particles_reordered[i, i_b].rho ** 2
-        rho_j = (
-            self.particles_reordered[j, i_b].rho
-            * self.particles_info_reordered[j, i_b].rho
-            / self.particles_info_reordered[j, i_b].rho
-        )
-        dp_j = self.particles_reordered[j, i_b].p / rho_j**2
+    def _task_compute_stress_forces(self, i, j, ret: qd.template(), i_b: qd.i32):
+        rho_i = self.particles_reordered[i, i_b].rho
+        rho_j = self.particles_reordered[j, i_b].rho
 
-        # Compute the pressure force contribution, Symmetric Formula
-        ret += (
-            -self.particles_info_reordered[j, i_b].rho
-            * self._particle_volume
-            * (dp_i + dp_j)
-            * self.cubic_kernel_derivative(self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos)
+        # Stress divergence, symmetric formula
+        ret += self.particles_info_reordered[j, i_b].mass * (
+            (self.particles_reordered[i, i_b].sigma / rho_i**2 + self.particles_reordered[j, i_b].sigma / rho_j**2)
+            @ self.cubic_kernel_derivative(self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos)
         )
 
     @qd.kernel
-    def _kernel_compute_pressure_forces(self, f: qd.i32):
+    def _kernel_compute_stress_forces(self, f: qd.i32):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles_ng_reordered[i_p, i_b].active:
+                acc = qd.Vector.zero(gs.qd_float, 3)
+
+                self.sh.for_all_neighbors(
+                    i_p,
+                    self.particles_reordered.pos,
+                    self._support_radius,
+                    acc,
+                    self._task_compute_stress_forces,
+                    i_b,
+                )
+                self.particles_reordered[i_p, i_b].acc += acc
+
+    @qd.kernel
+    def _kernel_compute_eos_pressure(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active and not self.particles_info_reordered[i_p, i_b].is_solid:
                 rho0 = self.particles_info_reordered[i_p, i_b].rho
                 stiff = self.particles_info_reordered[i_p, i_b].stiffness
                 expnt = self.particles_info_reordered[i_p, i_b].exponent
@@ -345,19 +407,10 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                     qd.pow(self.particles_reordered[i_p, i_b].rho / rho0, expnt) - 1.0
                 )
 
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active:
-                acc = qd.Vector.zero(gs.qd_float, 3)
-
-                self.sh.for_all_neighbors(
-                    i_p,
-                    self.particles_reordered.pos,  # shape [n_particles, B, 3] or similar
-                    self._support_radius,
-                    acc,
-                    self._task_compute_pressure_forces,
-                    i_b,
+                # Fluids enter the stress divergence as an isotropic pressure stress
+                self.particles_reordered[i_p, i_b].sigma = -self.particles_reordered[i_p, i_b].p * qd.Matrix.identity(
+                    gs.qd_float, 3
                 )
-                self.particles_reordered[i_p, i_b].acc += acc
 
     @qd.kernel
     def _kernel_advect_velocity(self, f: qd.i32):
@@ -381,6 +434,79 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 # update
                 self.particles_reordered[i_p, i_b].vel = corrected_vel
                 self.particles_reordered[i_p, i_b].pos = corrected_pos
+
+    # ------------------------------------------------------------------------------------
+    # --------------------------------- solid stress -------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @qd.func
+    def _task_compute_velocity_gradient(self, i, j, ret: qd.template(), i_b: qd.i32):
+        x_ij = self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos
+        grad_w = self.cubic_kernel_derivative(x_ij)
+        vol_j = self.particles_info_reordered[j, i_b].mass / self.particles_reordered[j, i_b].rho
+
+        ret.L += vol_j * qd.Matrix.outer_product(
+            self.particles_reordered[j, i_b].vel - self.particles_reordered[i, i_b].vel, grad_w
+        )
+
+        # Stress diffusion term (Feng), accumulated as a stress rate. The gravity correction cancels the geostatic
+        # stress difference, so the diffusion does not relax the weight of a settled column. The smoothing length is
+        # the support radius, which is twice the particle size in the genesis SPH convention.
+        psi = self.particles_reordered[i, i_b].sigma - self.particles_reordered[j, i_b].sigma
+        psi += self.particles_info_reordered[i, i_b].rho * self._gravity[i_b].dot(x_ij) * ret.gravity_correction
+        eta_sq = (0.1 * self._support_radius) ** 2
+        ret.stress_diffusion_sum += psi * (x_ij.dot(grad_w) / (x_ij.norm_sqr() + eta_sq)) * vol_j
+
+    @qd.kernel
+    def _kernel_compute_velocity_gradient(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active and self.particles_info_reordered[i_p, i_b].is_solid:
+                # Gravity correction of the stress diffusion, hoisted out of the neighbour sweep
+                gravity = self._gravity[i_b]
+                gravity_norm_sq = gravity.norm_sqr()
+                gravity_correction = qd.Matrix.zero(gs.qd_float, 3, 3)
+                if gravity_norm_sq > 1e-12:
+                    K0 = self.particles_info_reordered[i_p, i_b].K0
+                    gravity_correction = K0 * qd.Matrix.identity(gs.qd_float, 3) + (1.0 - K0) * (
+                        qd.Matrix.outer_product(gravity, gravity) / gravity_norm_sq
+                    )
+
+                ret = qd.Struct(
+                    L=qd.Matrix.zero(gs.qd_float, 3, 3),
+                    stress_diffusion_sum=qd.Matrix.zero(gs.qd_float, 3, 3),
+                    gravity_correction=gravity_correction,
+                )
+
+                self.sh.for_all_neighbors(
+                    i_p,
+                    self.particles_reordered.pos,
+                    self._support_radius,
+                    ret,
+                    self._task_compute_velocity_gradient,
+                    i_b,
+                )
+
+                self.particles_reordered[i_p, i_b].L = ret.L
+                self.stress_diffusion_sum[i_p, i_b] = ret.stress_diffusion_sum
+
+    @qd.kernel
+    def _kernel_update_stress(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active and self.particles_info_reordered[i_p, i_b].is_solid:
+                sigma = qd.Matrix.zero(gs.qd_float, 3, 3)
+                eps_p = gs.qd_float(0.0)
+                for material_idx in qd.static(self._materials_idx):
+                    if self.particles_info_reordered[i_p, i_b].material_idx == material_idx:
+                        sigma, eps_p = self._materials_update_stress[material_idx](
+                            dt=self._substep_dt,
+                            support_radius=self._support_radius,
+                            sigma=self.particles_reordered[i_p, i_b].sigma,
+                            L=self.particles_reordered[i_p, i_b].L,
+                            stress_diffusion_sum=self.stress_diffusion_sum[i_p, i_b],
+                            eps_p=self.particles_reordered[i_p, i_b].eps_p,
+                        )
+                self.particles_reordered[i_p, i_b].sigma = sigma
+                self.particles_reordered[i_p, i_b].eps_p = eps_p
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- DFSPH ----------------------------------------
@@ -726,8 +852,12 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self._kernel_reorder_particles(f)
             if self._pressure_solver == "WCSPH":
                 self._kernel_compute_rho(f)
+                if self._needs_stress:
+                    self._kernel_compute_velocity_gradient(f)
+                    self._kernel_update_stress(f)
                 self._kernel_compute_non_pressure_forces(f, self._sim.cur_t)
-                self._kernel_compute_pressure_forces(f)
+                self._kernel_compute_eos_pressure(f)
+                self._kernel_compute_stress_forces(f)
                 self._kernel_advect_velocity(f)
             elif self._pressure_solver == "DFSPH":
                 self._kernel_compute_rho(f)
@@ -837,6 +967,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         mat_exponent: qd.f32,
         mat_mu: qd.f32,
         mat_gamma: qd.f32,
+        mat_K0: qd.f32,
+        mat_idx: qd.i32,
+        is_solid: qd.i32,
         pos: qd.types.ndarray(),
     ):
         for i_p_, i_b in qd.ndrange(n_particles, self._B):
@@ -846,6 +979,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 self.particles[i_p, i_b].pos[i] = pos[i_p_, i]
             self.particles[i_p, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
             self.particles[i_p, i_b].p = 0
+            self.particles[i_p, i_b].L = qd.Matrix.zero(gs.qd_float, 3, 3)
+            self.particles[i_p, i_b].sigma = qd.Matrix.zero(gs.qd_float, 3, 3)
+            self.particles[i_p, i_b].eps_p = 0.0
 
         for i_p_ in range(n_particles):
             i_p = i_p_ + particle_start
@@ -854,6 +990,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles_info[i_p].exponent = mat_exponent
             self.particles_info[i_p].mu = mat_mu
             self.particles_info[i_p].gamma = mat_gamma
+            self.particles_info[i_p].K0 = mat_K0
+            self.particles_info[i_p].material_idx = mat_idx
+            self.particles_info[i_p].is_solid = qd.cast(is_solid, gs.qd_bool)
             self.particles_info[i_p].mass = self._particle_volume * mat_rho
 
     # ----------------------------------------------------------------------
@@ -944,10 +1083,12 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
     def _kernel_get_mass(
         self, particle_start: qd.i32, n_particles: qd.i32, mass: qd.types.ndarray(), envs_idx: qd.types.ndarray()
     ):
-        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
+        total_mass = gs.qd_float(0.0)
+        for i_p_ in range(n_particles):
             i_p = i_p_ + particle_start
-            i_b = envs_idx[i_b_]
-            mass[i_b_] += self.particles[i_p, i_b].m
+            total_mass += self.particles_info[i_p].mass
+        for i_b_ in range(envs_idx.shape[0]):
+            mass[i_b_] = total_mass
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
