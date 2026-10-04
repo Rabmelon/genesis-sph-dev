@@ -973,3 +973,56 @@ def test_soil_and_water_share_one_particle_set(show_viewer):
     mass_first = soil.get_mass()
     mass_second = soil.get_mass()
     assert_allclose(mass_first, mass_second, atol=gs.EPS)
+
+
+@pytest.mark.required
+def test_reset_restores_constitutive_state(show_viewer):
+    # The stress, velocity gradient and plastic strain are part of what a step carries over, so a reset must put them
+    # back where the scene started, which is exactly zero. A block settling under gravity builds all three up, and a
+    # reset that leaves them behind makes the next run start from the state the previous one ended in.
+    N_STEPS = 10
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        sph_options=gs.options.SPHOptions(
+            particle_size=0.02,
+            lower_bound=(-0.2, -0.2, 0.0),
+            upper_bound=(0.2, 0.2, 0.25),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.4, 0.3),
+            camera_lookat=(0.0, 0.0, 0.05),
+            camera_fov=40,
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.1, 0.1, 0.1),
+        ),
+        material=gs.materials.SPH.DruckerPrager(
+            sampler="regular",
+            rho=1600.0,
+            E=1e5,
+            nu=0.3,
+            friction_angle=30.0,
+            cohesion=0.0,
+        ),
+    )
+    scene.build()
+    solver = scene.sph_solver
+
+    for _ in range(N_STEPS):
+        scene.step()
+
+    assert np.abs(qd_to_numpy(solver.particles.sigma, transpose=True)[0]).max() > gs.EPS
+
+    scene.reset()
+
+    assert_allclose(qd_to_numpy(solver.particles.sigma, transpose=True)[0], 0.0, atol=gs.EPS)
+    assert_allclose(qd_to_numpy(solver.particles.L, transpose=True)[0], 0.0, atol=gs.EPS)
+    assert_allclose(qd_to_numpy(solver.particles.eps_p, transpose=True)[0], 0.0, atol=gs.EPS)

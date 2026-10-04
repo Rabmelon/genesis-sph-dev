@@ -239,6 +239,9 @@ class SPHSolverState:
         }
         self._pos = gs.zeros((scene.sim._B, scene.sim.sph_solver.n_particles, 3), **args)
         self._vel = gs.zeros((self._scene.sim._B, scene.sim.sph_solver.n_particles, 3), **args)
+        self._L = gs.zeros((self._scene.sim._B, scene.sim.sph_solver.n_particles, 3, 3), **args)
+        self._sigma = gs.zeros((self._scene.sim._B, scene.sim.sph_solver.n_particles, 3, 3), **args)
+        self._eps_p = gs.zeros((self._scene.sim._B, scene.sim.sph_solver.n_particles), **args)
         args["dtype"] = gs.tc_bool
         args["requires_grad"] = False
         self._active = gs.zeros((self._scene.sim._B, scene.sim.sph_solver.n_particles), **args)
@@ -254,6 +257,18 @@ class SPHSolverState:
     @property
     def vel(self):
         return self._vel
+
+    @property
+    def L(self):
+        return self._L
+
+    @property
+    def sigma(self):
+        return self._sigma
+
+    @property
+    def eps_p(self):
+        return self._eps_p
 
     @property
     def active(self):

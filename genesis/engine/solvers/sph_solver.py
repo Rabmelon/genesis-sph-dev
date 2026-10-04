@@ -904,7 +904,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
-            self._kernel_set_state(f, state.pos, state.vel, state.active)
+            self._kernel_set_state(f, state.pos, state.vel, state.L, state.sigma, state.eps_p, state.active)
 
     @qd.kernel
     def _kernel_set_state(
@@ -912,18 +912,25 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         f: qd.i32,
         pos: qd.types.ndarray(),
         vel: qd.types.ndarray(),
+        L: qd.types.ndarray(),
+        sigma: qd.types.ndarray(),
+        eps_p: qd.types.ndarray(),
         active: qd.types.ndarray(),
     ):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             for j in qd.static(range(3)):
                 self.particles[i_p, i_b].pos[j] = pos[i_b, i_p, j]
                 self.particles[i_p, i_b].vel[j] = vel[i_b, i_p, j]
+                for k in qd.static(range(3)):
+                    self.particles[i_p, i_b].L[j, k] = L[i_b, i_p, j, k]
+                    self.particles[i_p, i_b].sigma[j, k] = sigma[i_b, i_p, j, k]
+            self.particles[i_p, i_b].eps_p = eps_p[i_b, i_p]
             self.particles_ng[i_p, i_b].active = active[i_b, i_p]
 
     def get_state(self, f):
         if self.is_active:
             state = SPHSolverState(self.scene)
-            self._kernel_get_state(f, state.pos, state.vel, state.active)
+            self._kernel_get_state(f, state.pos, state.vel, state.L, state.sigma, state.eps_p, state.active)
         else:
             state = None
         return state
@@ -934,12 +941,19 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         f: qd.i32,
         pos: qd.types.ndarray(),
         vel: qd.types.ndarray(),
+        L: qd.types.ndarray(),
+        sigma: qd.types.ndarray(),
+        eps_p: qd.types.ndarray(),
         active: qd.types.ndarray(),
     ):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             for j in qd.static(range(3)):
                 pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
                 vel[i_b, i_p, j] = self.particles[i_p, i_b].vel[j]
+                for k in qd.static(range(3)):
+                    L[i_b, i_p, j, k] = self.particles[i_p, i_b].L[j, k]
+                    sigma[i_b, i_p, j, k] = self.particles[i_p, i_b].sigma[j, k]
+            eps_p[i_b, i_p] = self.particles[i_p, i_b].eps_p
             active[i_b, i_p] = self.particles_ng[i_p, i_b].active
 
     def update_render_fields(self):
