@@ -68,12 +68,12 @@ class LegacyCoupler(RBC):
             self.sph_rigid_normal = qd.Vector.field(
                 3,
                 dtype=gs.qd_float,
-                shape=(self.sph_solver.n_particles, self.rigid_solver.n_geoms_, self.sph_solver._B),
+                shape=(self.sph_solver.n_particles_total, self.rigid_solver.n_geoms_, self.sph_solver._B),
             )
             self.sph_rigid_normal_reordered = qd.Vector.field(
                 3,
                 dtype=gs.qd_float,
-                shape=(self.sph_solver.n_particles, self.rigid_solver.n_geoms_, self.sph_solver._B),
+                shape=(self.sph_solver.n_particles_total, self.rigid_solver.n_geoms_, self.sph_solver._B),
             )
 
         if self._rigid_pbd:
@@ -121,7 +121,9 @@ class LegacyCoupler(RBC):
 
     @qd.kernel
     def _kernel_reset_sph(self, envs_idx: qd.types.ndarray()):
-        for i_p, i_g, i_b_ in qd.ndrange(self.sph_solver.n_particles, self.rigid_solver.n_geoms, envs_idx.shape[0]):
+        for i_p, i_g, i_b_ in qd.ndrange(
+            self.sph_solver.n_particles_total, self.rigid_solver.n_geoms, envs_idx.shape[0]
+        ):
             self.sph_rigid_normal[i_p, i_g, envs_idx[i_b_]] = 0.0
 
     @qd.func
@@ -381,9 +383,13 @@ class LegacyCoupler(RBC):
                             self.sph_solver.sh.slot_start[slot_idx, i_b],
                             self.sph_solver.sh.slot_start[slot_idx, i_b] + self.sph_solver.sh.slot_size[slot_idx, i_b],
                         ):
+                            is_boundary = False
+                            if qd.static(self.sph_solver._has_boundary_particles):
+                                is_boundary = self.sph_solver.particles_info_reordered[i, i_b].is_boundary
                             if (
                                 qd.abs(pos - self.sph_solver.particles_reordered.pos[i, i_b]).max()
                                 < self.mpm_solver.dx * 0.5
+                                and not is_boundary
                             ):
                                 sph_vel += self.sph_solver.particles_reordered.vel[i, i_b]
                                 colliding_particles += 1
@@ -403,9 +409,13 @@ class LegacyCoupler(RBC):
                                 self.sph_solver.sh.slot_start[slot_idx, i_b]
                                 + self.sph_solver.sh.slot_size[slot_idx, i_b],
                             ):
+                                is_boundary = False
+                                if qd.static(self.sph_solver._has_boundary_particles):
+                                    is_boundary = self.sph_solver.particles_info_reordered[i, i_b].is_boundary
                                 if (
                                     qd.abs(pos - self.sph_solver.particles_reordered.pos[i, i_b]).max()
                                     < self.mpm_solver.dx * 0.5
+                                    and not is_boundary
                                 ):
                                     self.sph_solver.particles_reordered[i, i_b].vel = (
                                         self.sph_solver.particles_reordered[i, i_b].vel
@@ -620,7 +630,13 @@ class LegacyCoupler(RBC):
                                 self.sph_solver.sh.slot_start[slot_idx, i_b]
                                 + self.sph_solver.sh.slot_size[slot_idx, i_b],
                             ):
-                                if qd.abs(pos - self.sph_solver.particles_reordered.pos[k, i_b]).max() < dx * 0.5:
+                                is_boundary = False
+                                if qd.static(self.sph_solver._has_boundary_particles):
+                                    is_boundary = self.sph_solver.particles_info_reordered[k, i_b].is_boundary
+                                if (
+                                    qd.abs(pos - self.sph_solver.particles_reordered.pos[k, i_b]).max() < dx * 0.5
+                                    and not is_boundary
+                                ):
                                     sph_vel += self.sph_solver.particles_reordered.vel[k, i_b]
                                     colliding_particles += 1
 
@@ -641,7 +657,14 @@ class LegacyCoupler(RBC):
                                     self.sph_solver.sh.slot_start[slot_idx, i_b]
                                     + self.sph_solver.sh.slot_size[slot_idx, i_b],
                                 ):
-                                    if qd.abs(pos - self.sph_solver.particles_reordered.pos[k, i_b]).max() < dx * 0.5:
+                                    is_boundary = False
+                                    if qd.static(self.sph_solver._has_boundary_particles):
+                                        is_boundary = self.sph_solver.particles_info_reordered[k, i_b].is_boundary
+                                    if (
+                                        qd.abs(pos - self.sph_solver.particles_reordered.pos[k, i_b]).max()
+                                        < dx * 0.5
+                                        and not is_boundary
+                                    ):
                                         self.sph_solver.particles_reordered[k, i_b].vel = (
                                             self.sph_solver.particles_reordered[k, i_b].vel
                                             - delta_mv / self.sph_solver.particles_info_reordered[k, i_b].mass
@@ -674,8 +697,12 @@ class LegacyCoupler(RBC):
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
-        for i_p, i_b in qd.ndrange(self.sph_solver._n_particles, self.sph_solver._B):
-            if self.sph_solver.particles_ng_reordered[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self.sph_solver.n_particles_total, self.sph_solver._B):
+            is_simulated = self.sph_solver.particles_ng_reordered[i_p, i_b].active
+            if qd.static(self.sph_solver._has_boundary_particles):
+                # A boundary particle carries no mass and must not receive a collision impulse.
+                is_simulated = is_simulated and not self.sph_solver.particles_info_reordered[i_p, i_b].is_boundary
+            if is_simulated:
                 for i_g in range(self.rigid_solver.n_geoms):
                     if geoms_info.needs_coup[i_g]:
                         (

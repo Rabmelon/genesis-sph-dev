@@ -5,7 +5,7 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.boundaries import CubeBoundary
+from genesis.engine.boundaries import CubeBoundary, generate_dummy_particles
 from genesis.engine.entities import SPHEntity
 from genesis.engine.materials import SPH
 from genesis.engine.states.solvers import SPHSolverState
@@ -44,6 +44,11 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
         self._particle_volume = 0.8 * self._particle_size**3  # 0.8 is an empirical value
 
+        # Boundary particles are appended to the particle arrays and reordered along with the simulated particles, so
+        # every kernel that walks reordered particles needs to know whether the scene holds any.
+        self._boundary_friction = options.boundary_friction
+        self._has_boundary_particles = self._boundary_friction is not None
+
         # materials
         self._materials = list()
         self._materials_idx = list()
@@ -80,6 +85,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             L=gs.qd_mat3,  # velocity gradient
             sigma=gs.qd_mat3,  # Cauchy stress, tension positive
             eps_p=gs.qd_float,  # accumulated equivalent plastic strain
+            vel_vir=gs.qd_vec3,  # virtual velocity of a boundary particle
+            sigma_vir=gs.qd_mat3,  # virtual Cauchy stress of a boundary particle, tension positive
+            vol_vir=gs.qd_float,  # virtual volume of a boundary particle, gauged to restore the kernel support
         )
 
         # dynamic particle state without gradient
@@ -99,6 +107,8 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             K0=gs.qd_float,  # lateral stress coefficient of the stress-diffusion gravity correction
             material_idx=gs.qd_int,
             is_solid=gs.qd_bool,
+            is_boundary=gs.qd_bool,  # boundary particle, holding no material state
+            boundary_normal=gs.qd_vec3,  # outward normal of the face the boundary particle belongs to
         )
 
         # single frame particle state for rendering
@@ -109,33 +119,37 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         )
 
         # construct fields
+        # Boundary particles occupy the tail rows [n_particles, n_particles_total) of every particle array, and the
+        # same reordered index space as the simulated particles.
         self.particles = struct_particle_state.field(
-            shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
         self.particles_ng = struct_particle_state_ng.field(
-            shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
         self.particles_info = struct_particle_info.field(
-            shape=(self._n_particles,), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total,), needs_grad=False, layout=qd.Layout.SOA
         )
         self.particles_reordered = struct_particle_state.field(
-            shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
         self.particles_ng_reordered = struct_particle_state_ng.field(
-            shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
         self.particles_info_reordered = struct_particle_info.field(
-            shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
 
         self.particles_render = struct_particle_state_render.field(
-            shape=(self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+            shape=(self._n_particles_total, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
 
         # Stress diffusion term summed over the neighbours, read by the stress update within the same substep. It is
         # buffered because the velocity gradient sweep reads the stress field while the stress update writes it.
         if self._needs_stress:
-            self.stress_diffusion_sum = qd.field(gs.qd_mat3, shape=(self._n_particles, self._B), layout=qd.Layout.SOA)
+            self.stress_diffusion_sum = qd.field(
+                gs.qd_mat3, shape=(self._n_particles_total, self._B), layout=qd.Layout.SOA
+            )
 
     def init_ckpt(self):
         self._ckpt = dict()
@@ -150,6 +164,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
         # particles and entities
         self._n_particles = self.n_particles
+        self._n_particles_total = self._n_particles
 
         self._coupler = self.sim._coupler
 
@@ -160,12 +175,36 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             gs.raise_exception("Solid SPH materials are only supported by the 'WCSPH' pressure solver.")
 
         if self.is_active:
+            if self._has_boundary_particles:
+                if not solid_materials:
+                    gs.raise_exception(
+                        "'boundary_friction' is set but the scene holds no solid SPH material to support."
+                    )
+                boundary_positions, boundary_normals = generate_dummy_particles(
+                    self._lower_bound, self._upper_bound, self._particle_size, self._support_radius
+                )
+                self._n_particles_total = self._n_particles + boundary_positions.shape[0]
+                gs.logger.info(
+                    f"Generated {boundary_positions.shape[0]} boundary particles for the {self._n_particles} "
+                    "simulated particles."
+                )
+
             self.sh.build(self._B)
             self.init_particle_fields()
             self.init_ckpt()
 
             for entity in self.entities:
                 entity._add_to_solver()
+
+            if self._has_boundary_particles:
+                self._kernel_add_boundary_particles(
+                    self._sim.cur_substep_local,
+                    self._n_particles,
+                    boundary_positions.shape[0],
+                    solid_materials[0].rho,
+                    boundary_positions,
+                    boundary_normals,
+                )
 
             # Compute stable timestep for the given particle properties (mu) and support radius and print warning
             # if the current timestep is larger than the stable timestep. This formula is derived from
@@ -249,13 +288,13 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
     @qd.kernel
     def _kernel_reorder_particles(self, f: qd.i32):
         self.sh.compute_reordered_idx(
-            self._n_particles, self.particles.pos, self.particles_ng.active, self.particles_ng.reordered_idx
+            self._n_particles_total, self.particles.pos, self.particles_ng.active, self.particles_ng.reordered_idx
         )
 
         # copy to reordered
         self.particles_ng_reordered.active.fill(False)
 
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
             if self.particles_ng[i_p, i_b].active:
                 reordered_idx = self.particles_ng[i_p, i_b].reordered_idx
 
@@ -264,7 +303,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 self.particles_ng_reordered[reordered_idx, i_b].active = self.particles_ng[i_p, i_b].active
 
         if qd.static(self._coupler._rigid_sph):
-            for i_p, i_g, i_b in qd.ndrange(self._n_particles, self._coupler.rigid_solver.n_geoms, self._B):
+            for i_p, i_g, i_b in qd.ndrange(self._n_particles_total, self._coupler.rigid_solver.n_geoms, self._B):
                 if self.particles_ng[i_p, i_b].active:
                     self._coupler.sph_rigid_normal_reordered[self.particles_ng[i_p, i_b].reordered_idx, i_g, i_b] = (
                         self._coupler.sph_rigid_normal[i_p, i_g, i_b]
@@ -272,13 +311,13 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_copy_from_reordered(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
             if self.particles_ng[i_p, i_b].active:
                 # only need to copy back dynamic state, i.e. self.particles
                 self.particles[i_p, i_b] = self.particles_reordered[self.particles_ng[i_p, i_b].reordered_idx, i_b]
 
         if qd.static(self._coupler._rigid_sph):
-            for i_p, i_g, i_b in qd.ndrange(self._n_particles, self._coupler.rigid_solver.n_geoms, self._B):
+            for i_p, i_g, i_b in qd.ndrange(self._n_particles_total, self._coupler.rigid_solver.n_geoms, self._B):
                 if self.particles_ng[i_p, i_b].active:
                     self._coupler.sph_rigid_normal[i_p, i_g, i_b] = self._coupler.sph_rigid_normal_reordered[
                         self.particles_ng[i_p, i_b].reordered_idx, i_g, i_b
@@ -292,8 +331,11 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_compute_rho(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_simulated = self.particles_ng_reordered[i_p, i_b].active
+            if qd.static(self._has_boundary_particles):
+                is_simulated = is_simulated and not self.particles_info_reordered[i_p, i_b].is_boundary
+            if is_simulated:
                 # Base density using the kernel at distance 0
                 self.particles_reordered[i_p, i_b].rho = self._particle_volume * self.cubic_kernel(0.0)
 
@@ -347,8 +389,11 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_compute_non_pressure_forces(self, f: qd.i32, t: qd.f32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_simulated = self.particles_ng_reordered[i_p, i_b].active
+            if qd.static(self._has_boundary_particles):
+                is_simulated = is_simulated and not self.particles_info_reordered[i_p, i_b].is_boundary
+            if is_simulated:
                 acc = self._gravity[i_b]
                 self.sh.for_all_neighbors(
                     i_p,
@@ -379,8 +424,11 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_compute_stress_forces(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_simulated = self.particles_ng_reordered[i_p, i_b].active
+            if qd.static(self._has_boundary_particles):
+                is_simulated = is_simulated and not self.particles_info_reordered[i_p, i_b].is_boundary
+            if is_simulated:
                 acc = qd.Vector.zero(gs.qd_float, 3)
 
                 self.sh.for_all_neighbors(
@@ -395,8 +443,13 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_compute_eos_pressure(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active and not self.particles_info_reordered[i_p, i_b].is_solid:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_fluid = (
+                self.particles_ng_reordered[i_p, i_b].active and not self.particles_info_reordered[i_p, i_b].is_solid
+            )
+            if qd.static(self._has_boundary_particles):
+                is_fluid = is_fluid and not self.particles_info_reordered[i_p, i_b].is_boundary
+            if is_fluid:
                 rho0 = self.particles_info_reordered[i_p, i_b].rho
                 stiff = self.particles_info_reordered[i_p, i_b].stiffness
                 expnt = self.particles_info_reordered[i_p, i_b].exponent
@@ -414,14 +467,20 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_advect_velocity(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_simulated = self.particles_ng_reordered[i_p, i_b].active
+            if qd.static(self._has_boundary_particles):
+                is_simulated = is_simulated and not self.particles_info_reordered[i_p, i_b].is_boundary
+            if is_simulated:
                 self.particles_reordered[i_p, i_b].vel += self._substep_dt * self.particles_reordered[i_p, i_b].acc
 
     @qd.kernel
     def _kernel_advect_position(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng_reordered[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_simulated = self.particles_ng_reordered[i_p, i_b].active
+            if qd.static(self._has_boundary_particles):
+                is_simulated = is_simulated and not self.particles_info_reordered[i_p, i_b].is_boundary
+            if is_simulated:
                 pos = self.particles_reordered[i_p, i_b].pos
                 new_vel = self.particles_reordered[i_p, i_b].vel
 
@@ -459,7 +518,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_compute_velocity_gradient(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
             if self.particles_ng_reordered[i_p, i_b].active and self.particles_info_reordered[i_p, i_b].is_solid:
                 # Gravity correction of the stress diffusion, hoisted out of the neighbour sweep
                 gravity = self._gravity[i_b]
@@ -491,7 +550,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_update_stress(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
             if self.particles_ng_reordered[i_p, i_b].active and self.particles_info_reordered[i_p, i_b].is_solid:
                 sigma = qd.Matrix.zero(gs.qd_float, 3, 3)
                 eps_p = gs.qd_float(0.0)
@@ -961,13 +1020,16 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @qd.kernel
     def _kernel_update_render_fields(self, f: qd.i32):
-        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
-            if self.particles_ng[i_p, i_b].active:
+        for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
+            is_rendered = self.particles_ng[i_p, i_b].active
+            if qd.static(self._has_boundary_particles):
+                is_rendered = is_rendered and not self.particles_info[i_p].is_boundary
+            if is_rendered:
                 self.particles_render[i_p, i_b].pos = self.particles[i_p, i_b].pos
                 self.particles_render[i_p, i_b].vel = self.particles[i_p, i_b].vel
             else:
                 self.particles_render[i_p, i_b].pos = gu.qd_nowhere()
-            self.particles_render[i_p, i_b].active = self.particles_ng[i_p, i_b].active
+            self.particles_render[i_p, i_b].active = is_rendered
 
     @qd.kernel
     def _kernel_add_particles(
@@ -996,6 +1058,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles[i_p, i_b].L = qd.Matrix.zero(gs.qd_float, 3, 3)
             self.particles[i_p, i_b].sigma = qd.Matrix.zero(gs.qd_float, 3, 3)
             self.particles[i_p, i_b].eps_p = 0.0
+            self.particles[i_p, i_b].vel_vir = qd.Vector.zero(gs.qd_float, 3)
+            self.particles[i_p, i_b].sigma_vir = qd.Matrix.zero(gs.qd_float, 3, 3)
+            self.particles[i_p, i_b].vol_vir = self._particle_volume
 
         for i_p_ in range(n_particles):
             i_p = i_p_ + particle_start
@@ -1008,6 +1073,42 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles_info[i_p].material_idx = mat_idx
             self.particles_info[i_p].is_solid = qd.cast(is_solid, gs.qd_bool)
             self.particles_info[i_p].mass = self._particle_volume * mat_rho
+            self.particles_info[i_p].is_boundary = False
+            self.particles_info[i_p].boundary_normal = qd.Vector.zero(gs.qd_float, 3)
+
+    @qd.kernel
+    def _kernel_add_boundary_particles(
+        self,
+        f: qd.i32,
+        particle_start: qd.i32,
+        n_particles: qd.i32,
+        mat_rho: qd.f32,
+        pos: qd.types.ndarray(),
+        normal: qd.types.ndarray(),
+    ):
+        for i_p_, i_b in qd.ndrange(n_particles, self._B):
+            i_p = i_p_ + particle_start
+            self.particles_ng[i_p, i_b].active = True
+            for i in qd.static(range(3)):
+                self.particles[i_p, i_b].pos[i] = pos[i_p_, i]
+            self.particles[i_p, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
+            self.particles[i_p, i_b].acc = qd.Vector.zero(gs.qd_float, 3)
+            self.particles[i_p, i_b].rho = mat_rho
+            self.particles[i_p, i_b].vel_vir = qd.Vector.zero(gs.qd_float, 3)
+            self.particles[i_p, i_b].sigma_vir = qd.Matrix.zero(gs.qd_float, 3, 3)
+            self.particles[i_p, i_b].vol_vir = self._particle_volume
+
+        for i_p_ in range(n_particles):
+            i_p = i_p_ + particle_start
+            # Boundary particles hold no material state: they carry no mass and are not solid, which keeps them out of
+            # the material kernels and out of the couplers. Their density is the rest density of a solid material, so
+            # that a neighbour term dividing by it stays finite.
+            self.particles_info[i_p].rho = mat_rho
+            self.particles_info[i_p].mass = 0.0
+            self.particles_info[i_p].is_solid = False
+            self.particles_info[i_p].is_boundary = True
+            for i in qd.static(range(3)):
+                self.particles_info[i_p].boundary_normal[i] = normal[i_p_, i]
 
     # ----------------------------------------------------------------------
 
@@ -1112,6 +1213,14 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
     def n_particles(self):
         if self.is_built:
             return self._n_particles
+        else:
+            return sum([entity.n_particles for entity in self._entities])
+
+    @property
+    def n_particles_total(self):
+        """Number of particle rows in the solver arrays, the boundary particles included."""
+        if self.is_built:
+            return self._n_particles_total
         else:
             return sum([entity.n_particles for entity in self._entities])
 

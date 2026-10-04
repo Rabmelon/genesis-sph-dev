@@ -741,6 +741,12 @@ class SPHOptions(GravityMixin, TimeBasedMixin):
         Lower bound of the simulation domain. Defaults to (-100.0, -100.0, 0.0).
     upper_bound : tuple, shape (3,), optional
         Upper bound of the simulation domain. Defaults to (100.0, 100.0, 100.0).
+    boundary_friction : float, optional
+        Coulomb friction coefficient of the domain boundaries, for solid materials. If None, the boundaries keep the
+        particles inside the domain but support them only through their positions, which under-resolves the density
+        and stress of particles next to a wall. Setting it lines the domain boundaries with static wall particles
+        that restore that support, at the cost of a larger particle count and a proportionally slower simulation. 0
+        gives frictionless walls and a positive value makes them no-slip. Defaults to None.
     hash_grid_res : tuple, optional
         Size of the spatially-repetitive spatial hashing grid in meters. If none, it will be computed automatically. Defaults to None.
     hash_grid_cell_size : float, optional
@@ -760,6 +766,8 @@ class SPHOptions(GravityMixin, TimeBasedMixin):
 
     lower_bound: Vec3FType = (-100.0, -100.0, 0.0)
     upper_bound: Vec3FType = (100.0, 100.0, 100.0)
+
+    boundary_friction: NonNegativeFloat | None = None
 
     # spatial hashing
     hash_grid_res: Vec3FType | None = None  # size of the spatially-repetitive hash grid in meters
@@ -799,6 +807,11 @@ class SPHOptions(GravityMixin, TimeBasedMixin):
             self._hash_grid_res = np.minimum(max_hash_grid_res, 150).astype(int).tolist()
         else:
             self._hash_grid_res = np.ceil(np.array(self.hash_grid_res) / self.hash_grid_cell_size).astype(int).tolist()
+
+        if self.boundary_friction is not None:
+            # The hash grid covers the layer of wall particles sitting outside the domain bounds.
+            boundary_grid_res = int(np.ceil(2 * self._support_radius / self.hash_grid_cell_size))
+            self._hash_grid_res = [grid_res + boundary_grid_res for grid_res in self._hash_grid_res]
 
 
 class PBDOptions(GravityMixin, TimeBasedMixin):
