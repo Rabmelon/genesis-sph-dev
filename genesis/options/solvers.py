@@ -746,7 +746,11 @@ class SPHOptions(GravityMixin, TimeBasedMixin):
         particles inside the domain but support them only through their positions, which under-resolves the density
         and stress of particles next to a wall. Setting it lines the domain boundaries with static wall particles
         that restore that support, at the cost of a larger particle count and a proportionally slower simulation. 0
-        gives frictionless walls and a positive value makes them no-slip. Defaults to None.
+        gives frictionless walls. A positive value applies Coulomb friction to the particles at a wall, with a
+        tangential traction of at most this coefficient times the wall-normal reaction of the contact between the
+        material particle and the wall particle facing it: the material then holds, creeping slowly, while the
+        traction it needs stays below the bound, and slides above it, while a particle pulling away from the wall
+        feels no traction. Defaults to None.
     hash_grid_res : tuple, optional
         Size of the spatially-repetitive spatial hashing grid in meters. If none, it will be computed automatically. Defaults to None.
     hash_grid_cell_size : float, optional
@@ -809,7 +813,9 @@ class SPHOptions(GravityMixin, TimeBasedMixin):
             self._hash_grid_res = np.ceil(np.array(self.hash_grid_res) / self.hash_grid_cell_size).astype(int).tolist()
 
         if self.boundary_friction is not None:
-            # The hash grid covers the layer of wall particles sitting outside the domain bounds.
+            # The wall particles sit outside the domain bounds. Sizing the grid for them gives their lattice its own
+            # cells instead of sharing slots with the domain, which keeps the particle count per neighbour slot, and
+            # with it the neighbour scanning cost, at the level the grid was sized for.
             boundary_grid_res = int(np.ceil(2 * self._support_radius / self.hash_grid_cell_size))
             self._hash_grid_res = [grid_res + boundary_grid_res for grid_res in self._hash_grid_res]
 

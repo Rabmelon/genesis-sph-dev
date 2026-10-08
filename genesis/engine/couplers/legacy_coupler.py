@@ -661,8 +661,7 @@ class LegacyCoupler(RBC):
                                     if qd.static(self.sph_solver._has_boundary_particles):
                                         is_boundary = self.sph_solver.particles_info_reordered[k, i_b].is_boundary
                                     if (
-                                        qd.abs(pos - self.sph_solver.particles_reordered.pos[k, i_b]).max()
-                                        < dx * 0.5
+                                        qd.abs(pos - self.sph_solver.particles_reordered.pos[k, i_b]).max() < dx * 0.5
                                         and not is_boundary
                                     ):
                                         self.sph_solver.particles_reordered[k, i_b].vel = (

@@ -35,7 +35,6 @@ class Elastic(Base):
     # Derived material parameters, set in model_post_init.
     K: ValidFloat = Field(default=0.0, exclude=True)
     G: ValidFloat = Field(default=0.0, exclude=True)
-    c_p: ValidFloat = Field(default=0.0, exclude=True)
 
     needs_stress: bool = Field(default=True, exclude=True, repr=False)
 

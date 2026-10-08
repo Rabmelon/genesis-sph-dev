@@ -57,6 +57,10 @@ class Base(Material["SPHEntity"]):
     # elastic or frictional parameters, 1.0 meaning an isotropic correction.
     K0: ValidFloat = Field(default=1.0, exclude=True)
 
+    # P-wave speed, which sets the impedance of the wall friction penalty and stays zero where the material carries
+    # no elastic wave. Derived by each solid material from its elastic parameters.
+    c_p: ValidFloat = Field(default=0.0, exclude=True)
+
     # Dispatch fields - set by subclass model_post_init, not user-specified. needs_stress turns the velocity
     # gradient and stress update kernels on for the materials that carry a constitutive stress.
     update_stress: Any = Field(default=None, exclude=True, repr=False)

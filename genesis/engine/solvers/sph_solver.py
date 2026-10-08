@@ -45,9 +45,10 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         self._particle_volume = 0.8 * self._particle_size**3  # 0.8 is an empirical value
 
         # Boundary particles are appended to the particle arrays and reordered along with the simulated particles, so
-        # every kernel that walks reordered particles needs to know whether the scene holds any.
-        self._boundary_friction = options.boundary_friction
-        self._has_boundary_particles = self._boundary_friction is not None
+        # every kernel that walks reordered particles needs to know whether the scene holds any. The friction
+        # coefficient travels to the momentum kernel as an argument, a value of zero leaving the walls frictionless.
+        self._boundary_friction = 0.0 if options.boundary_friction is None else options.boundary_friction
+        self._has_boundary_particles = options.boundary_friction is not None
 
         # materials
         self._materials = list()
@@ -105,6 +106,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             mu=gs.qd_float,  # viscosity
             gamma=gs.qd_float,  # surface tension
             K0=gs.qd_float,  # lateral stress coefficient of the stress-diffusion gravity correction
+            c_p=gs.qd_float,  # P-wave speed, the impedance the wall friction penalty scales by
             material_idx=gs.qd_int,
             is_solid=gs.qd_bool,
             is_boundary=gs.qd_bool,  # boundary particle, holding no material state
@@ -426,43 +428,76 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         rho_j = self.particles_reordered[j, i_b].rho
         mass_j = self.particles_info_reordered[j, i_b].mass
         sigma_j = self.particles_reordered[j, i_b].sigma
+        grad_w = self.cubic_kernel_derivative(
+            self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos
+        )
 
-        # A boundary neighbour acts through the solid particle it faces: it borrows that particle's rest density and
-        # brings its own virtual volume and stress. Fluid particles take no support from the walls and keep a
-        # zero-weight pair, since a boundary particle carries no mass.
-        is_boundary_j = False
+        # A boundary neighbour acts through the solid particle it faces: it borrows that particle's rest density for
+        # its mass and brings its own virtual volume and stress. It stands in for the mirror image of the centre
+        # across the wall plane, whose computed density equals the centre's by lattice symmetry, so it carries
+        # rho_j = rho_i and its sigma_vir / rho_j^2 weighs like a real neighbour of the same state. Fluid particles
+        # take no support from the walls and keep a zero-weight pair, since a boundary particle carries no mass.
         if qd.static(self._has_boundary_particles):
-            is_boundary_j = self.particles_info_reordered[j, i_b].is_boundary
-            if is_boundary_j and self.particles_info_reordered[i, i_b].is_solid:
+            if self.particles_info_reordered[j, i_b].is_boundary and self.particles_info_reordered[i, i_b].is_solid:
                 rho0_i = self.particles_info_reordered[i, i_b].rho
-                rho_j = rho0_i
+                rho_j = rho_i
                 mass_j = self.particles_reordered[j, i_b].vol_vir * rho0_i
                 sigma_j = self.particles_reordered[j, i_b].sigma_vir
 
+                # Coulomb friction between the wall and the particle: the wall carries a tangential traction that
+                # opposes the slip, bounded by mu times the normal pressure the pair presses the wall with. The bound
+                # alone decides between holding and sliding. Below it the traction is proportional to the slip
+                # velocity, which vanishes with that velocity, so a particle at rest feels nothing and a zero mu
+                # leaves exactly the free-slip wall. The normal pressure is the sum of two wall-normal tractions of
+                # the same sign and comparable magnitude: the material-side arm carries the normal traction of the
+                # particle's stress, and the wall-side arm the normal traction of the particle's free-slip mirror
+                # image.
+                normal = self.particles_info_reordered[j, i_b].boundary_normal
+                vel_i = self.particles_reordered[i, i_b].vel
+                vel_t = vel_i - vel_i.dot(normal) * normal
+                vel_t_norm = vel_t.norm()
+                normal_pressure = qd.max(-normal.dot((self.particles_reordered[i, i_b].sigma + sigma_j) @ normal), 0.0)
+
+                # The velocity-proportional branch carries the P-wave impedance of the material, rho0 * c_p,
+                # computed from the initial density rho0 by construction. A settled particle runs at a density around
+                # 0.8 rho0. An impedance times a velocity is the traction an acoustic wave of that particle velocity
+                # carries, so the penalty stays within the elastic response of the material, and its arrest time, one
+                # wave transit of a particle spacing, is the shortest the elastic timestep resolves. A larger
+                # impedance would relax the slip faster than the scheme resolves and demand a shorter stable
+                # timestep.
+                friction_impedance = rho0_i * self.particles_info_reordered[i, i_b].c_p
+                tau_fric = qd.min(ret.wall_friction * normal_pressure, friction_impedance * vel_t_norm)
+
+                # The traction enters the momentum equation as the material-side arm of the stress divergence does,
+                # m_b (T / rho_i^2) @ grad W, dimensional as [kg] [Pa] [m^6 kg^-2] [m^-4] = [m s^-2]. Grad W runs
+                # along the outward normal of the wall lattice, so this tensor opposes the slip of the particle.
+                t_hat = vel_t / qd.max(vel_t_norm, gs.EPS)
+                traction_fric = -tau_fric * (
+                    qd.Matrix.outer_product(t_hat, normal) + qd.Matrix.outer_product(normal, t_hat)
+                )
+                ret.acc += mass_j * (traction_fric / rho_i**2) @ grad_w
+
         # Stress divergence, symmetric formula
-        ret += mass_j * (
-            (self.particles_reordered[i, i_b].sigma / rho_i**2 + sigma_j / rho_j**2)
-            @ self.cubic_kernel_derivative(self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos)
-        )
+        ret.acc += mass_j * ((self.particles_reordered[i, i_b].sigma / rho_i**2 + sigma_j / rho_j**2) @ grad_w)
 
     @qd.kernel
-    def _kernel_compute_stress_forces(self, f: qd.i32):
+    def _kernel_compute_stress_forces(self, f: qd.i32, wall_friction: qd.f32):
         for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
             is_simulated = self.particles_ng_reordered[i_p, i_b].active
             if qd.static(self._has_boundary_particles):
                 is_simulated = is_simulated and not self.particles_info_reordered[i_p, i_b].is_boundary
             if is_simulated:
-                acc = qd.Vector.zero(gs.qd_float, 3)
+                ret = qd.Struct(acc=qd.Vector.zero(gs.qd_float, 3), wall_friction=wall_friction)
 
                 self.sh.for_all_neighbors(
                     i_p,
                     self.particles_reordered.pos,
                     self._support_radius,
-                    acc,
+                    ret,
                     self._task_compute_stress_forces,
                     i_b,
                 )
-                self.particles_reordered[i_p, i_b].acc += acc
+                self.particles_reordered[i_p, i_b].acc += ret.acc
 
     @qd.kernel
     def _kernel_compute_eos_pressure(self, f: qd.i32):
@@ -532,7 +567,14 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         if qd.static(self._has_boundary_particles):
             is_boundary_j = self.particles_info_reordered[j, i_b].is_boundary
             if is_boundary_j:
-                vol_j = self.particles_reordered[j, i_b].vol_vir
+                # The wall stands in for the centre's mirror image across the wall plane, so it weighs what that
+                # neighbour would: vol_vir over the density ratio rho_i / rho0_i it carries, like every real
+                # neighbour's mass / rho.
+                vol_j = (
+                    self.particles_reordered[j, i_b].vol_vir
+                    * self.particles_info_reordered[i, i_b].rho
+                    / self.particles_reordered[i, i_b].rho
+                )
                 v_j = self.particles_reordered[j, i_b].vel_vir
 
         ret.L += vol_j * qd.Matrix.outer_product(v_j - self.particles_reordered[i, i_b].vel, grad_w)
@@ -658,22 +700,39 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 # over-restore the density there.
                 self.particles_reordered[i_p, i_b].vol_vir = self._particle_volume
 
-                # The wall applies no return mapping, so a tensile trace would pull the adjacent material: clamp it.
-                if sigma_ext.trace() > 0.0:
-                    sigma_ext = qd.Matrix.zero(gs.qd_float, 3, 3)
-
                 normal = self.particles_info_reordered[i_p, i_b].boundary_normal
+
+                # The stress channel of the wall is free-slip: it carries the mirror image of the extrapolated stress
+                # across the wall plane, the reflection R sigma R with R = I - 2 n n^T, which keeps the normal
+                # traction and reverses the tangential one. The tangential traction of a pair then cancels between
+                # this image arm and the material-side arm, which carries the wall friction alone (see the Coulomb
+                # friction in _task_compute_stress_forces).
+                traction = sigma_ext @ normal
+                traction_normal = normal.dot(traction)
+                traction_shear = traction - traction_normal * normal
+                sigma_vir = sigma_ext - 2.0 * (
+                    qd.Matrix.outer_product(traction_shear, normal) + qd.Matrix.outer_product(normal, traction_shear)
+                )
+
+                # The wall applies no return mapping, so a tensile trace would pull the adjacent material: clamp it.
+                if sigma_vir.trace() > 0.0:
+                    sigma_vir = qd.Matrix.zero(gs.qd_float, 3, 3)
+
+                # The mirror reverses the normal component of the relative velocity, which keeps the material from
+                # crossing the wall, and carries the tangential one through as the extrapolation gives it, so the
+                # velocity path injects no tangential drag of its own.
                 v_wall = self.particles_reordered[i_p, i_b].vel
                 v_vir = v_ext - 2.0 * (v_ext - v_wall).dot(normal) * normal
-                if self._boundary_friction > 0:
-                    v_vir = 2.0 * v_wall - v_ext
 
                 self.particles_reordered[i_p, i_b].vel_vir = v_vir
-                self.particles_reordered[i_p, i_b].sigma_vir = sigma_ext
+                self.particles_reordered[i_p, i_b].sigma_vir = sigma_vir
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- DFSPH ----------------------------------------
     # ------------------------------------------------------------------------------------
+    # The DFSPH sweeps run over the simulated particles alone: boundary particles require a solid material and build
+    # refuses the pressure solver together with one, so the sweeps need no boundary gate (see the refusal in build).
+
     @qd.func
     def _task_compute_DFSPH_factor(self, i, j, ret: qd.template(), i_b):
         # Fluid neighbors
@@ -1023,7 +1082,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                     self._kernel_update_stress(f)
                 self._kernel_compute_non_pressure_forces(f, self._sim.cur_t)
                 self._kernel_compute_eos_pressure(f)
-                self._kernel_compute_stress_forces(f)
+                self._kernel_compute_stress_forces(f, self._boundary_friction)
                 self._kernel_advect_velocity(f)
             elif self._pressure_solver == "DFSPH":
                 self._kernel_compute_rho(f)
@@ -1151,6 +1210,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         mat_mu: qd.f32,
         mat_gamma: qd.f32,
         mat_K0: qd.f32,
+        mat_c_p: qd.f32,
         mat_idx: qd.i32,
         is_solid: qd.i32,
         pos: qd.types.ndarray(),
@@ -1177,6 +1237,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles_info[i_p].mu = mat_mu
             self.particles_info[i_p].gamma = mat_gamma
             self.particles_info[i_p].K0 = mat_K0
+            self.particles_info[i_p].c_p = mat_c_p
             self.particles_info[i_p].material_idx = mat_idx
             self.particles_info[i_p].is_solid = qd.cast(is_solid, gs.qd_bool)
             self.particles_info[i_p].mass = self._particle_volume * mat_rho
@@ -1214,6 +1275,9 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles_info[i_p].mass = 0.0
             self.particles_info[i_p].is_solid = False
             self.particles_info[i_p].is_boundary = True
+            # The material index names no registered material, so a consumer keying on it cannot take a wall row for a
+            # simulated particle.
+            self.particles_info[i_p].material_idx = -1
             for i in qd.static(range(3)):
                 self.particles_info[i_p].boundary_normal[i] = normal[i_p_, i]
 

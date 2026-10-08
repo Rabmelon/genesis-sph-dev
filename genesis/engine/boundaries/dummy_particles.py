@@ -7,9 +7,12 @@ def generate_dummy_particles(lower, upper, spacing, support_radius):
     """Generate the boundary particle lattice that covers the six faces of the simulation domain.
 
     The lattice holds one layer every `spacing`, the first half a spacing outside the face and the last one reaching
-    past the support radius. Face priority follows the axes, x then y then z: a face spans the extended range along
-    every axis whose own faces come later, and the domain range along the axes whose faces come earlier, so edges and
-    corners carry exactly one particle each, named after the face that owns them.
+    past the support radius. The half-spacing outward offset puts each boundary particle on the position the mirror
+    image of a simulated particle would occupy, whenever the simulated particles stand on the lattice the domain
+    bounds imply, which restores the kernel support of a wall. Face priority follows the
+    axes, x then y then z: a face spans the extended range along every axis whose own faces come later, and the
+    domain range along the axes whose faces come earlier, so edges and corners carry exactly one particle each,
+    named after the face that owns them.
 
     Parameters
     ----------
@@ -29,9 +32,6 @@ def generate_dummy_particles(lower, upper, spacing, support_radius):
     normals : np.ndarray, shape (n_particles, 3)
         Outward normal of the face the particle belongs to.
     """
-    lower = np.asarray(lower)
-    upper = np.asarray(upper)
-
     n_layers = int(np.ceil(support_radius / spacing)) + 1
     offsets = 0.5 * spacing + spacing * np.arange(n_layers)
     extent = offsets[-1]
@@ -40,9 +40,7 @@ def generate_dummy_particles(lower, upper, spacing, support_radius):
     coords_extended = list()
     for i_axis in range(3):
         coords_interior.append(np.arange(lower[i_axis], upper[i_axis] + 0.5 * spacing, spacing))
-        coords_extended.append(
-            np.arange(lower[i_axis] - extent, upper[i_axis] + extent + 0.5 * spacing, spacing)
-        )
+        coords_extended.append(np.arange(lower[i_axis] - extent, upper[i_axis] + extent + 0.5 * spacing, spacing))
 
     positions = list()
     normals = list()

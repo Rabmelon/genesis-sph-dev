@@ -1026,3 +1026,161 @@ def test_reset_restores_constitutive_state(show_viewer):
     assert_allclose(qd_to_numpy(solver.particles.sigma, transpose=True)[0], 0.0, atol=gs.EPS)
     assert_allclose(qd_to_numpy(solver.particles.L, transpose=True)[0], 0.0, atol=gs.EPS)
     assert_allclose(qd_to_numpy(solver.particles.eps_p, transpose=True)[0], 0.0, atol=gs.EPS)
+
+
+@pytest.mark.required
+def test_boundary_particles_restore_the_wall_kernel_support(show_viewer):
+    # A wall truncates the kernel support of the particle row lying on it, so that row reads a density well below the
+    # interior of the block, and the deficit is what lines the domain with boundary particles remove. The two scenes
+    # differ by the boundary_friction option alone, the second one being the control that measures the deficit.
+    particle_size = 0.02
+    box_center = (0.0, 0.0, 0.05)
+    box_size = (0.1, 0.1, 0.1)
+    box_bottom = box_center[2] - 0.5 * box_size[2]
+
+    def settle_block(boundary_friction):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=1e-3,
+                gravity=(0.0, 0.0, -9.81),
+            ),
+            sph_options=gs.options.SPHOptions(
+                particle_size=particle_size,
+                lower_bound=(-0.2, -0.2, 0.0),
+                upper_bound=(0.2, 0.2, 0.25),
+                boundary_friction=boundary_friction,
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                camera_pos=(0.4, -0.4, 0.2),
+                camera_lookat=(0.0, 0.0, 0.05),
+                camera_fov=40,
+            ),
+            show_viewer=show_viewer,
+        )
+        block = scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=box_center,
+                size=box_size,
+            ),
+            material=gs.materials.SPH.DruckerPrager(
+                rho=1600.0,
+                E=1e5,
+                nu=0.3,
+                friction_angle=30.0,
+                cohesion=0.0,
+                sampler="regular",
+            ),
+        )
+        scene.build()
+        scene.step()
+        return (
+            tensor_to_array(block.get_particles_pos()),
+            qd_to_numpy(scene.sph_solver.particles.rho, transpose=True)[0][: block.n_particles],
+        )
+
+    poss, density_with_wall = settle_block(0.5)
+    _, density_without_wall = settle_block(None)
+
+    # The central column alone: the block is narrow enough for its own side rows to read a truncated support of their
+    # own. The row on the floor sits half a spacing above the box bottom, and the rows above it stop one short of the
+    # free surface, whose own truncation would mix into the comparison.
+    z_from_bottom = poss[:, 2] - box_bottom
+    is_center = (np.abs(poss[:, 0]) <= particle_size) & (np.abs(poss[:, 1]) <= particle_size)
+    is_base = is_center & (z_from_bottom < particle_size)
+    is_interior = is_center & (z_from_bottom > 2.0 * particle_size) & (z_from_bottom < 4.0 * particle_size)
+    assert is_base.any() and is_interior.any()
+
+    assert_allclose(density_with_wall[is_base].mean(), density_with_wall[is_interior].mean(), rtol=0.05)
+    assert density_without_wall[is_base].mean() < 0.9 * density_without_wall[is_interior].mean()
+
+
+@pytest.mark.required
+def test_boundary_friction_resists_a_sliding_block(show_viewer):
+    # A block settles under vertical gravity, then gravity is tilted. A wall particle mirrors the normal component of
+    # the velocity of the material it faces and leaves the tangential one free, so a frictionless wall lets the block
+    # accelerate at g sin(theta). A positive friction coefficient bounds the tangential traction of the wall by the
+    # coefficient times the wall-normal force the weight of the block sets, so the block holds while the traction it
+    # needs stays below the bound, creeping at the small slip velocity the bound leaves, and slides above it at the
+    # acceleration g (sin(theta) - mu cos(theta)) the saturated bound predicts.
+    particle_size = 0.02
+    tilt_hold = np.radians(12.0)
+    tilt_slide = np.radians(35.0)
+    n_settle = 100
+    n_slide = 200
+    slide_window = (0.04, 0.16)
+    hold_window = 0.05
+
+    def create_scene(boundary_friction):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=1e-3,
+                gravity=(0.0, 0.0, -9.81),
+            ),
+            sph_options=gs.options.SPHOptions(
+                particle_size=particle_size,
+                lower_bound=(-0.2, -0.2, 0.0),
+                upper_bound=(0.2, 0.2, 0.25),
+                boundary_friction=boundary_friction,
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                camera_pos=(0.4, -0.4, 0.2),
+                camera_lookat=(0.0, 0.0, 0.05),
+                camera_fov=40,
+            ),
+            show_viewer=show_viewer,
+        )
+        block = scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, 0.05),
+                size=(0.1, 0.1, 0.1),
+            ),
+            material=gs.materials.SPH.DruckerPrager(
+                rho=1600.0,
+                E=1e5,
+                nu=0.3,
+                friction_angle=30.0,
+                cohesion=20000.0,
+                sampler="regular",
+            ),
+        )
+        scene.build()
+        return scene, block
+
+    def slope_trace(scene, block, tilt):
+        scene.sim.set_gravity((9.81 * np.sin(tilt), 0.0, -9.81 * np.cos(tilt)))
+        com_x_0 = float(tensor_to_array(block.get_particles_pos()).mean(axis=0)[0])
+        times, speeds, drifts = [], [], []
+        for i_step in range(n_slide):
+            scene.step()
+            times.append((i_step + 1) * scene.sph_solver.substep_dt)
+            speeds.append(float(tensor_to_array(block.get_particles_vel()).mean(axis=0)[0]))
+            drifts.append(float(tensor_to_array(block.get_particles_pos()).mean(axis=0)[0]) - com_x_0)
+        return np.array(times), np.array(speeds), np.array(drifts)
+
+    def slide_acceleration(times, speeds):
+        window = (times >= slide_window[0]) & (times <= slide_window[1])
+        return float(np.polyfit(times[window], speeds[window], 1)[0])
+
+    # A frictionless wall carries no tangential traction at all, so the block accelerates at the full gravity
+    # component.
+    scene_free_slip, block_free_slip = create_scene(0.0)
+    for _ in range(n_settle):
+        scene_free_slip.step()
+    times, speeds, _ = slope_trace(scene_free_slip, block_free_slip, tilt_hold)
+    assert_allclose(slide_acceleration(times, speeds), 9.81 * np.sin(tilt_hold), rtol=0.15)
+
+    # The same block against a wall of coefficient 0.5 holds at a tilt below the crossover, measured around 20 to
+    # 22 degrees instead of the atan(0.5) = 26.6 degrees of a rigid block, and around 8 degrees at a coefficient of
+    # 0.2 instead of atan(0.2) = 11.3 degrees. The free-slip arm reads about 7 percent more drive than g sin(theta),
+    # a known bias the stress stabilizers add. Below the crossover the block creeps at a speed that stays under the
+    # tenth of a metre per second the free-slip arm passes, and above it the block slides at the acceleration the
+    # saturated bound leaves. The tolerance on the coefficient it implies covers the same excess drive.
+    scene_friction, block_friction = create_scene(0.5)
+    for _ in range(n_settle):
+        scene_friction.step()
+    times, speeds, _ = slope_trace(scene_friction, block_friction, tilt_hold)
+    assert abs(slide_acceleration(times, speeds)) < 0.1
+    assert np.abs(speeds[times >= hold_window]).max() < 0.1
+    times, speeds, _ = slope_trace(scene_friction, block_friction, tilt_slide)
+    friction_coefficient = (9.81 * np.sin(tilt_slide) - slide_acceleration(times, speeds)) / (9.81 * np.cos(tilt_slide))
+    assert_allclose(friction_coefficient, 0.5, rtol=0.3)
