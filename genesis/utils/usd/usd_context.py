@@ -6,18 +6,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, NamedTuple
+from typing import NamedTuple
 
-import filelock
 import numpy as np
 import torch
+
+import filelock
 from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 import genesis as gs
 import genesis.utils.mesh as mu
 from genesis.constants import USD_FORMATS
+from genesis.utils.cache import get_usd_bake_path, get_usd_zip_path
 
 from .usd_material import parse_material_preview_surface
 from .usd_utils import extract_scale
@@ -33,7 +36,7 @@ except ImportError:
 
 
 def decompress_usdz(usdz_path: str):
-    usdz_folder = mu.get_usd_zip_path(usdz_path)
+    usdz_folder = get_usd_zip_path(usdz_path)
 
     # The first file in the package must be a native usd file.
     # See https://openusd.org/docs/Usdz-File-Format-Specification.html
@@ -136,7 +139,7 @@ class UsdContext:
             )
 
         # detect bake file caches
-        self._bake_folder = mu.get_usd_bake_path(stage_file)
+        self._bake_folder = get_usd_bake_path(stage_file)
         self._bake_stage_file = os.path.join(self._bake_folder, os.path.basename(stage_file))
         if use_bake_cache:
             if os.path.exists(self._bake_stage_file):
@@ -257,9 +260,9 @@ class UsdContext:
         """
         Emit a one-time warning that cross-entity USD collision filtering is not applied.
 
-        ``scene.add_stage`` splits a stage into separate entities, and collision filtering is solved
+        ``scene.add_stage`` splits a stage into separate entities, and collision filtering is applied
         per entity. A CollisionGroup / FilteredPairsAPI relationship that spans two prims which end up
-        in different entities cannot be expressed as per-entity contype/conaffinity, so those pairs
+        in different entities cannot be expressed as a link pair of one entity, so those pairs
         keep colliding. Within-entity (self-collision) filtering is unaffected.
         """
         if not self._is_cross_entity_filtering_warned:

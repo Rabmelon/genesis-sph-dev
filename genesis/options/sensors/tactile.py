@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+
 from pydantic import Field, StrictBool
 
 import genesis as gs
@@ -25,12 +26,12 @@ from .options import (
     ProbesWithNormalSensorOptionsMixin,
     RigidSensorOptionsMixin,
     SensorOptions,
-    SensorT,
     SimpleSensorOptions,
     _check_len_match,
 )
 
 if TYPE_CHECKING:
+    from genesis.engine.sensors.base_sensor import Sensor
     from genesis.engine.sensors.kinematic_tactile import (
         ContactDepthProbeSensor,
         ContactProbeSensor,
@@ -51,7 +52,7 @@ def _validate_filler_probe_radius(probe_radius, sensor_name: str) -> None:
         gs.raise_exception(f"{sensor_name} requires at least one positive probe_radius. Got {probe_radius}.")
 
 
-class ViscoelasticHysteresisOptionsMixin(SensorOptions[SensorT]):
+class ViscoelasticHysteresisOptionsMixin[SensorT: "Sensor"](SensorOptions[SensorT]):
     """
     Single-Maxwell viscoelastic hysteresis applied on the measured branch only.
 
@@ -102,7 +103,7 @@ def _validate_crosstalk_kernel(kernel) -> None:
         gs.raise_exception("crosstalk_kernel entries must be finite.")
 
 
-class SpatialCrosstalkOptionsMixin(SensorOptions[SensorT]):
+class SpatialCrosstalkOptionsMixin[SensorT: "Sensor"](SensorOptions[SensorT]):
     """
     Grid spatial crosstalk applied on the measured branch: each taxel's force/torque bleeds onto its grid neighbors,
     modeling mechanical coupling through the sensor's compliant layer.
@@ -154,7 +155,7 @@ class SpatialCrosstalkOptionsMixin(SensorOptions[SensorT]):
             _validate_crosstalk_kernel(self.crosstalk_kernel)
 
 
-class TactileProbeSensorOptionsMixin(ProbeSensorOptionsMixin[SensorT]):
+class TactileProbeSensorOptionsMixin[SensorT: "Sensor"](ProbeSensorOptionsMixin[SensorT]):
     """
     Tactile probe sensors estimate contact from geometric depth queries (SDF or raycast) around each probe position
     rather than reading the physics solver's contact impulses, so they sense at arbitrary probe locations without
@@ -179,8 +180,8 @@ class TactileProbeSensorOptionsMixin(ProbeSensorOptionsMixin[SensorT]):
     dead_taxel_value_range : (float, float), optional
         Uniform range for the dead value sampled per probe on reset. Default ``(0.0, 0.0)``.
     contact_depth_query : {"sdf", "raycast"} or None, optional
-        Per-probe contact-depth backend. ``"sdf"`` queries the per-geom analytic SDF grid (fast, exact for primitives,
-        requires SDF activation). ``"raycast"`` walks the rigid solver's per-frame collision-mesh BVH and takes the
+        Per-probe contact-depth backend. ``"sdf"`` queries the per-geom analytic SDF grid (fast, exact for primitives).
+        ``"raycast"`` walks the rigid solver's per-frame collision-mesh BVH and takes the
         signed distance to the nearest candidate triangle (sign from the triangle's face normal, negative inside),
         so ``pen = R - signed_distance`` matches the SDF backend while handling arbitrary meshes uniformly (shares
         the BVH with ``RaycasterSensor``). ``None`` (default) defers the choice: all sensors of the same class must
@@ -211,7 +212,7 @@ class TactileProbeSensorOptionsMixin(ProbeSensorOptionsMixin[SensorT]):
             gs.raise_exception(f"dead_taxel_value_range must satisfy low <= high. Got ({low}, {high}).")
 
 
-class PointCloudTactileSensorMixin(TactileProbeSensorOptionsMixin[SensorT]):
+class PointCloudTactileSensorMixin[SensorT: "Sensor"](TactileProbeSensorOptionsMixin[SensorT]):
     """
     Options mixin for tactile sensors that sample a point cloud from tracked link meshes.
 
@@ -240,7 +241,7 @@ class PointCloudTactileSensorMixin(TactileProbeSensorOptionsMixin[SensorT]):
     debug_point_cloud_radius: PositiveFloat = 0.002
 
 
-class ContactHysteresisOptionsMixin(SensorOptions[SensorT]):
+class ContactHysteresisOptionsMixin[SensorT: "Sensor"](SensorOptions[SensorT]):
     """
     Schmitt-trigger contact gate shared by the stateful tactile sensors, in penetration-depth units.
 

@@ -30,7 +30,8 @@ except ImportError:
 def mesh_path(mesh_file):
     path = os.path.join(get_assets_dir(), mesh_file)
     if not os.path.exists(path):
-        path = os.path.join(get_hf_dataset(pattern=mesh_file), mesh_file)
+        # Fetch the files sharing the name of the mesh, such as the material library of an OBJ
+        path = os.path.join(get_hf_dataset(pattern=f"{os.path.splitext(mesh_file)[0]}.*"), mesh_file)
     return path
 
 
@@ -385,8 +386,13 @@ def compare_mesh_scene(compared_scene: gs.Scene, usd_scene: gs.Scene, tol: float
 
 def build_mjcf_scene(xml_path: str, scale: float):
     """Build a MJCF scene from its file path."""
-    # Create MJCF scene
-    mjcf_scene = gs.Scene()
+    # The scene is only built to compare the parsed model, which does not depend on collision detection, whose kernels
+    # take most of the time spent building a scene.
+    mjcf_scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+    )
 
     mjcf_scene.add_entity(
         gs.morphs.MJCF(
@@ -414,8 +420,11 @@ def build_usd_scene(
     show_viewer: bool = False,
 ):
     """Build a USD scene from its file path."""
-    # Create USD scene
+    # See build_mjcf_scene for collision detection.
     scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
         show_viewer=show_viewer,
     )
 
@@ -452,7 +461,12 @@ def build_usd_scene(
 
 def build_mesh_scene(mesh_file: str, scale: float):
     """Build a mesh scene from its file path."""
-    mesh_scene = gs.Scene()
+    # See build_mjcf_scene for collision detection.
+    mesh_scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+    )
     mesh_morph = gs.morphs.Mesh(
         file=mesh_file,
         scale=scale,
@@ -585,19 +599,26 @@ def texcoord_1_accessor_zero_glb(asset_tmp_path):
 
 
 @pytest.fixture(scope="session")
-def emissive_material_variants_glb(asset_tmp_path):
-    """Path to a GLB with three materials on distinct base/emissive texCoord sets and a triangle carrying two of them.
+def material_variants_glb(asset_tmp_path):
+    """Path to a GLB with materials on distinct base/emissive texCoord sets and on every alpha mode, and a triangle
+    carrying all of them but one.
 
-    The materials are a base-color atlas (red) on texCoord 0 with an emissive atlas on texCoord 1, a flat base color
-    with an emissive atlas on texCoord 1, and a KHR_materials_unlit material whose red base atlas stands in for the
-    unlit imagery. The red base atlas is index 0. The triangle holds the first two materials as primitives, with the
-    same texture coordinates stored as float in set 0 and as normalized UNSIGNED_SHORT, an encoding core glTF allows,
-    in set 1."""
+    The first materials are a base-color atlas (red) on texCoord 0 with an emissive atlas on texCoord 1, a flat base
+    color with an emissive atlas on texCoord 1, and a KHR_materials_unlit material whose red base atlas stands in for
+    the unlit imagery. The red base atlas is index 0. Then come a masked, a masked with an alpha factor of 0.6, a
+    blended and an opaque material, on an RGBA atlas whose alpha is a ramp. The triangle holds every material but the
+    unlit one as primitives, with the same texture coordinates stored as float in set 0 and as normalized
+    UNSIGNED_SHORT, an encoding core glTF allows, in set 1."""
     images = []
     for color in (np.array([220, 30, 30], np.uint8), np.array([30, 220, 30], np.uint8)):
         buffer = io.BytesIO()
         Image.fromarray(np.broadcast_to(color, (8, 8, 3)).copy()).save(buffer, format="PNG")
         images.append(buffer.getvalue())
+    rgba = np.full((1, 5, 4), 255, dtype=np.uint8)
+    rgba[..., 3] = (0, 64, 128, 192, 255)
+    buffer = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(buffer, format="PNG")
+    images.append(buffer.getvalue())
 
     positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
     uvs = np.array([[0.125, 0.25], [0.375, 0.5], [0.625, 0.75]], dtype=np.float32)
@@ -620,22 +641,22 @@ def emissive_material_variants_glb(asset_tmp_path):
                     pygltflib.Primitive(
                         attributes=pygltflib.Attributes(POSITION=0, TEXCOORD_0=1, TEXCOORD_1=2), material=material
                     )
-                    for material in range(2)
+                    for material in (0, 1, 3, 4, 5, 6)
                 ]
             )
         ],
         accessors=[
             pygltflib.Accessor(
-                bufferView=2,
+                bufferView=3,
                 componentType=pygltflib.FLOAT,
                 count=3,
                 type="VEC3",
                 min=positions.min(axis=0).tolist(),
                 max=positions.max(axis=0).tolist(),
             ),
-            pygltflib.Accessor(bufferView=3, componentType=pygltflib.FLOAT, count=3, type="VEC2"),
+            pygltflib.Accessor(bufferView=4, componentType=pygltflib.FLOAT, count=3, type="VEC2"),
             pygltflib.Accessor(
-                bufferView=4, componentType=pygltflib.UNSIGNED_SHORT, normalized=True, count=3, type="VEC2"
+                bufferView=5, componentType=pygltflib.UNSIGNED_SHORT, normalized=True, count=3, type="VEC2"
             ),
         ],
         materials=[
@@ -657,14 +678,31 @@ def emissive_material_variants_glb(asset_tmp_path):
                 ),
                 extensions={"KHR_materials_unlit": {}},
             ),
+            *(
+                pygltflib.Material(
+                    name=name,
+                    pbrMetallicRoughness=pygltflib.PbrMetallicRoughness(
+                        baseColorTexture=pygltflib.TextureInfo(index=2, texCoord=0),
+                        baseColorFactor=[1.0, 1.0, 1.0, alpha_factor],
+                    ),
+                    alphaMode=alpha_mode,
+                    alphaCutoff=alpha_cutoff,
+                )
+                for name, alpha_mode, alpha_cutoff, alpha_factor in (
+                    ("masked", "MASK", 0.6, 1.0),
+                    ("masked_factor", "MASK", 0.5, 0.6),
+                    ("blended", "BLEND", 0.5, 1.0),
+                    ("opaque", "OPAQUE", 0.5, 1.0),
+                )
+            ),
         ],
-        textures=[pygltflib.Texture(source=0), pygltflib.Texture(source=1)],
-        images=[pygltflib.Image(bufferView=i, mimeType="image/png") for i in range(2)],
+        textures=[pygltflib.Texture(source=i) for i in range(3)],
+        images=[pygltflib.Image(bufferView=i, mimeType="image/png") for i in range(3)],
         bufferViews=buffer_views,
         buffers=[pygltflib.Buffer(byteLength=len(blob))],
     )
     gltf.set_binary_blob(blob)
-    path = asset_tmp_path / "emissive_material_variants.glb"
+    path = asset_tmp_path / "material_variants.glb"
     gltf.save_binary(str(path))
     return str(path)
 
@@ -1599,8 +1637,9 @@ def collision_approximation_usd(asset_tmp_path):
 
 @pytest.fixture(scope="session")
 def collision_filtering_usd(asset_tmp_path):
-    """Two rigid bodies with in-model collision filtering: one via FilteredPairsAPI between its two
-    collision cubes, one via CollisionGroups (A filters B, plus an ungrouped collider)."""
+    """Two articulations whose child links overlap their base link, with in-model collision filtering: one via
+    FilteredPairsAPI between its two links, one via CollisionGroups (A filters B). Two child links of the latter carry
+    a second collider reaching into the base, only one of their two colliders being in group B."""
     usd_file = str(asset_tmp_path / "collision_filtering.usda")
     stage = Usd.Stage.CreateNew(usd_file)
     UsdGeom.SetStageUpAxis(stage, "Z")
@@ -1609,29 +1648,54 @@ def collision_filtering_usd(asset_tmp_path):
     root_prim = stage.DefinePrim("/root", "Xform")
     stage.SetDefaultPrim(root_prim)
 
-    pair_body = stage.DefinePrim("/root/pair_body", "Xform")
-    UsdPhysics.RigidBodyAPI.Apply(pair_body)
-    for name, x in (("col_a", 0.0), ("col_b", 0.3)):
-        cube = UsdGeom.Cube.Define(stage, f"/root/pair_body/{name}")
-        cube.GetSizeAttr().Set(0.2)
-        cube.AddTranslateOp().Set(Gf.Vec3d(x, 0.0, 0.1))
-        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    # Each link states its name, its position in the base frame, and the position of its second collider if any, which
+    # reaches 1 cm deep into the base as the first collider of the links beside it does.
+    for body_name, body_pos_y, links_spec in (
+        ("pair_body", 0.0, (("col_a", (0.0, 0.0), None), ("col_b", (0.19, 0.0), None))),
+        (
+            "group_body",
+            1.0,
+            (
+                ("col_c", (0.0, 0.0), None),
+                ("col_d", (0.19, 0.0), None),
+                ("col_e", (-0.19, 0.0), (0.05, 0.0)),
+                ("col_f", (0.0, 0.21), (0.0, -0.07)),
+            ),
+        ),
+    ):
+        base_path = f"/root/{body_name}/{links_spec[0][0]}"
+        for link_name, link_pos, extra_pos in links_spec:
+            link = UsdGeom.Xform.Define(stage, f"/root/{body_name}/{link_name}")
+            link.AddTranslateOp().Set(Gf.Vec3d(link_pos[0], body_pos_y + link_pos[1], 0.1))
+            UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+            cube = UsdGeom.Cube.Define(stage, f"{link.GetPath()}/collider")
+            cube.GetSizeAttr().Set(0.2)
+            UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+            if extra_pos is not None:
+                cube = UsdGeom.Cube.Define(stage, f"{link.GetPath()}/collider_extra")
+                cube.GetSizeAttr().Set(0.1)
+                cube.AddTranslateOp().Set(Gf.Vec3d(*extra_pos, 0.0))
+                UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+            if link_name != links_spec[0][0]:
+                joint = UsdPhysics.RevoluteJoint.Define(stage, f"/root/{body_name}/{link_name}_joint")
+                joint.CreateBody0Rel().SetTargets([base_path])
+                joint.CreateBody1Rel().SetTargets([link.GetPath()])
+                joint.CreateAxisAttr().Set("Z")
+                joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*link_pos, 0.0))
+                joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
     UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/root/pair_body/col_a")).CreateFilteredPairsRel().AddTarget(
         "/root/pair_body/col_b"
     )
 
-    group_body = stage.DefinePrim("/root/group_body", "Xform")
-    UsdPhysics.RigidBodyAPI.Apply(group_body)
-    UsdGeom.Xform(group_body).AddTranslateOp().Set(Gf.Vec3d(0.0, 1.0, 0.0))
-    for name, x in (("col_c", 0.0), ("col_d", 0.3), ("col_e", 0.6)):
-        cube = UsdGeom.Cube.Define(stage, f"/root/group_body/{name}")
-        cube.GetSizeAttr().Set(0.2)
-        cube.AddTranslateOp().Set(Gf.Vec3d(x, 0.0, 0.1))
-        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
     group_a = UsdPhysics.CollisionGroup.Define(stage, "/root/collision_groups/A")
     group_b = UsdPhysics.CollisionGroup.Define(stage, "/root/collision_groups/B")
     group_a.GetCollidersCollectionAPI().CreateIncludesRel().AddTarget("/root/group_body/col_c")
-    group_b.GetCollidersCollectionAPI().CreateIncludesRel().AddTarget("/root/group_body/col_d")
+    for collider_path in (
+        "/root/group_body/col_d",
+        "/root/group_body/col_e/collider_extra",
+        "/root/group_body/col_f/collider",
+    ):
+        group_b.GetCollidersCollectionAPI().CreateIncludesRel().AddTarget(collider_path)
     group_a.CreateFilteredGroupsRel().AddTarget("/root/collision_groups/B")
 
     stage.Save()

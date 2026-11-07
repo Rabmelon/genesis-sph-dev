@@ -1,8 +1,9 @@
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
+import genesis.utils.geom as gu
 from genesis.constants import GEOM_TYPE
+from genesis.utils.array_class import DynInfo, DynState, GeomsInitAABB, RigidInfo
 
 
 @qd.func
@@ -78,24 +79,86 @@ def func_det3(v1: qd.types.vector(3), v2: qd.types.vector(3), v3: qd.types.vecto
 
 
 @qd.func
-def func_point_in_geom_aabb(
-    i_g: int, i_b: int, point: qd.types.vector(3), expansion: float, dyn_state: array_class.DynState
-):
+def func_point_in_geom_aabb(i_g: int, i_b: int, point: qd.types.vector(3), expansion: float, dyn_state: DynState):
     aabb_min = dyn_state.geoms.aabb_min[i_g, i_b] - expansion
     aabb_max = dyn_state.geoms.aabb_max[i_g, i_b] + expansion
     return (point > aabb_min).all() and (point < aabb_max).all()
 
 
 @qd.func
-def func_is_geom_aabbs_overlap(i_ga: int, i_gb: int, i_b: int, dyn_state: array_class.DynState):
-    return not (
+def func_is_geom_boxes_overlap(
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    geoms_init_AABB: GeomsInitAABB,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+):
+    """Check whether the world-aligned boxes of two geoms overlap, and for two convex geoms their oriented boxes too.
+
+    The oriented box of a geom is its rest-pose box moved with it. It bounds a convex geom much tighter than the
+    world-aligned box of a rotated geom, so the separating axis test of both oriented boxes drops most of the pairs that
+    the world-aligned boxes keep without any contact. Planes and terrains collide beyond their box, and non-convex geoms
+    go through their own detection, so their pairs keep the world-aligned test alone.
+    """
+    is_overlapping = not (
         (dyn_state.geoms.aabb_max[i_ga, i_b] <= dyn_state.geoms.aabb_min[i_gb, i_b]).any()
         or (dyn_state.geoms.aabb_min[i_ga, i_b] >= dyn_state.geoms.aabb_max[i_gb, i_b]).any()
     )
+    # The pair comes by increasing geom type (see func_broad_phase_geoms), the plane and the terrain being the first and
+    # the last ones
+    if (
+        is_overlapping
+        and dyn_info.geoms.is_convex[i_ga]
+        and dyn_info.geoms.is_convex[i_gb]
+        and dyn_info.geoms.type[i_ga] != GEOM_TYPE.PLANE
+        and dyn_info.geoms.type[i_gb] != GEOM_TYPE.TERRAIN
+    ):
+        EPS = rigid_info.EPS[None]
+        half_a = 0.5 * (geoms_init_AABB[i_ga, 7] - geoms_init_AABB[i_ga, 0])
+        half_b = 0.5 * (geoms_init_AABB[i_gb, 7] - geoms_init_AABB[i_gb, 0])
+        center_a = 0.5 * (geoms_init_AABB[i_ga, 7] + geoms_init_AABB[i_ga, 0])
+        center_b = 0.5 * (geoms_init_AABB[i_gb, 7] + geoms_init_AABB[i_gb, 0])
+
+        # The axes of box b and the offset of its center, in the frame of box a
+        quat_a = dyn_state.geoms.quat[i_ga, i_b]
+        R_ab = gu.qd_quat_to_R(gu.qd_quat_mul(gu.qd_inv_quat(quat_a), dyn_state.geoms.quat[i_gb, i_b]), EPS)
+        R_ab_abs = qd.abs(R_ab)
+        pos_ab = gu.qd_inv_transform_by_quat(dyn_state.geoms.pos[i_gb, i_b] - dyn_state.geoms.pos[i_ga, i_b], quat_a)
+        offset = pos_ab + R_ab @ center_b - center_a
+
+        # The detections report a contact within their tolerance of touching, a small fraction of the pair scale (see
+        # func_compute_geom_pair_scale), which this margin stays well above
+        margin = 1e-3 * qd.min(half_a.norm(), half_b.norm())
+
+        # The face axes of both boxes
+        extent_a = R_ab_abs @ half_b + half_a
+        extent_b = R_ab_abs.transpose() @ half_a + half_b
+        is_overlapping = (qd.abs(offset) <= extent_a + margin).all() and (
+            qd.abs(R_ab.transpose() @ offset) <= extent_b + margin
+        ).all()
+
+        # The axes crossing axis i_3 of box a with axis j_3 of box b, which lie in the plane of the other axes i_31 and
+        # i_32 of box a and project box b on its other axes j_31 and j_32. They stay unnormalized: the margin grows
+        # relative to both projections as the edges turn parallel, which only keeps more pairs.
+        for i_3 in qd.static(range(3)):
+            i_31, i_32 = qd.static((i_3 + 1) % 3, (i_3 + 2) % 3)
+            for j_3 in qd.static(range(3)):
+                j_31, j_32 = qd.static((j_3 + 1) % 3, (j_3 + 2) % 3)
+                extent = (
+                    half_a[i_31] * R_ab_abs[i_32, j_3]
+                    + half_a[i_32] * R_ab_abs[i_31, j_3]
+                    + half_b[j_31] * R_ab_abs[i_3, j_32]
+                    + half_b[j_32] * R_ab_abs[i_3, j_31]
+                )
+                if qd.abs(offset[i_32] * R_ab[i_31, j_3] - offset[i_31] * R_ab[i_32, j_3]) > extent + margin:
+                    is_overlapping = False
+    return is_overlapping
 
 
 @qd.func
-def func_is_discrete_geom(i_g: int, dyn_info: array_class.DynInfo):
+def func_is_discrete_geom(i_g: int, dyn_info: DynInfo):
     """
     Check if the given geom is a discrete geometry.
     """
@@ -104,7 +167,7 @@ def func_is_discrete_geom(i_g: int, dyn_info: array_class.DynInfo):
 
 
 @qd.func
-def func_is_discrete_geoms(i_ga: int, i_gb: int, dyn_info: array_class.DynInfo):
+def func_is_discrete_geoms(i_ga: int, i_gb: int, dyn_info: DynInfo):
     """
     Check if the given geoms are discrete geometries.
     """

@@ -1,7 +1,8 @@
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Generic, TypeVar
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import genesis as gs
 from genesis.options.recorders import RecorderOptions
@@ -11,10 +12,7 @@ if TYPE_CHECKING:
     from .recorder_manager import RecorderManager
 
 
-T = TypeVar("T")
-
-
-class Recorder(Generic[T]):
+class Recorder[T]:
     """
     Base class for all recorders.
 
@@ -232,7 +230,7 @@ class Recorder(Generic[T]):
 
         global_time = global_step * self._manager._step_dt
         # A sample that raises ends the recorder for good, on this thread as on a worker (see '_process_data_loop'): a
-        # reset restarts the others (see 'RecorderManager.reset') and the stop flushes what it wrote.
+        # reset leaves it out (see 'RecorderManager.reset') and the stop flushes what it wrote.
         try:
             # Sanitize to CPU numpy once at the boundary: process() code never has to branch on torch vs numpy, and no
             # GPU tensor is ever queued for cross-thread access in threaded mode.
@@ -272,7 +270,7 @@ class Recorder(Generic[T]):
 
     @property
     def is_alive(self) -> bool:
-        """Whether no sample or write of the recorder raised. A recorder that raised records no more, a reset restarts
-        the others (see 'RecorderManager.reset'), and the stop flushes what it wrote.
+        """Whether no sample or write of the recorder raised. A recorder that raised records no more, a reset leaves it
+        out (see 'RecorderManager.reset'), and the stop flushes what it wrote.
         """
         return self._is_alive

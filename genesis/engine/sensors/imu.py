@@ -6,10 +6,10 @@ import torch
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.options.sensors import IMU as IMUOptions
 from genesis.options.sensors import CrossCouplingAxisType
+from genesis.utils.array_class import DynState, RigidInfo
 from genesis.utils.misc import concat_with_tensor, make_tensor_field, tensor_to_array
 
 from .base_sensor import RigidSensorMetadataMixin, RigidSensorMixin, SimpleSensor, SimpleSensorMetadata
@@ -29,8 +29,8 @@ def _kernel_update_imu_raw_data(
     offsets_quat: qd.types.ndarray(),
     magnetic_field_vector: qd.types.ndarray(),
     raw_data_T: qd.types.ndarray(),
-    dyn_state: array_class.DynState,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    rigid_info: RigidInfo,
 ):
     """
     Compute the raw (linear acceleration, angular velocity, magnetic field) triplet of every IMU in its own frame.
@@ -137,7 +137,6 @@ class IMUSensor(RigidSensorMixin[IMUSharedMetadata], SimpleSensor[IMUOptions, No
 
         super().__init__(options, idx, shared_context, shared_metadata, manager)
 
-        self.debug_objects: list["Mesh"] = []
         self.quat_offset: torch.Tensor
         self.pos_offset: torch.Tensor
 
@@ -220,12 +219,10 @@ class IMUSensor(RigidSensorMixin[IMUSharedMetadata], SimpleSensor[IMUOptions, No
         data_xyz = data.view(data.shape[0], -1, 3)
         data_xyz.copy_(torch.matmul(shared_metadata.alignment_rot_matrix, data_xyz.unsqueeze(-1)).squeeze(-1))
 
-    def _draw_debug(self, context: "RasterizerContext"):
-        """
-        Draw debug arrow for the IMU acceleration.
-
-        Only draws for first rendered environment.
-        """
+    def _draw_debug(self, context: "RasterizerContext", envs_idx: list[int]) -> list[tuple[None, "Mesh", None]]:
+        """Make arrows of the measured acceleration, angular velocity and magnetic field, in the first rendered env."""
+        if 0 not in envs_idx:
+            return []
         env_idx = context.rendered_envs_idx[0] if self._manager._sim.n_envs > 0 else None
 
         quat = self._link.get_quat(env_idx, relative=False).reshape((4,))
@@ -243,15 +240,9 @@ class IMUSensor(RigidSensorMixin[IMUSharedMetadata], SimpleSensor[IMUOptions, No
         gyro_vec = tensor_to_array(gu.transform_by_quat(gyro_vec, offset_quat))
         mag_vec = tensor_to_array(gu.transform_by_quat(mag_vec, offset_quat))
 
-        for debug_object in self.debug_objects:
-            context.clear_debug_object(debug_object)
-        self.debug_objects.clear()
-
-        self.debug_objects += filter(
-            None,
-            (
-                context.draw_debug_arrow(pos=pos, vec=acc_vec, radius=0.006, color=self._options.debug_acc_color),
-                context.draw_debug_arrow(pos=pos, vec=gyro_vec, radius=0.0055, color=self._options.debug_gyro_color),
-                context.draw_debug_arrow(pos=pos, vec=mag_vec, radius=0.005, color=self._options.debug_mag_color),
-            ),
+        arrows = (
+            context.make_debug_arrow(pos=pos, vec=acc_vec, radius=0.006, color=self._options.debug_acc_color),
+            context.make_debug_arrow(pos=pos, vec=gyro_vec, radius=0.0055, color=self._options.debug_gyro_color),
+            context.make_debug_arrow(pos=pos, vec=mag_vec, radius=0.005, color=self._options.debug_mag_color),
         )
+        return [(None, arrow, None) for arrow in arrows if arrow is not None]

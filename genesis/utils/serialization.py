@@ -12,17 +12,17 @@ import io
 import json
 import os
 import pathlib
-import sys
 import types
 import typing
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Iterable, Mapping, Sequence, Set
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from functools import lru_cache, partial
 from typing import Callable, NamedTuple
 
 import numpy as np
+
 from frozendict import frozendict
 from pydantic import AfterValidator, TypeAdapter, ValidationError, ValidationInfo
 
@@ -37,7 +37,7 @@ ARRAY_MEMBER = "arrays.npz"
 
 # This dict records how to write a class from another library to a file and read it back. Such a class cannot
 # declare this itself. '_class_codec' walks the method resolution order, so a subclass falls back to its base's pair.
-_REGISTERED: dict[type, tuple[Callable, Callable]] = {}
+_REGISTERED: dict[type, tuple[Callable, Callable | None]] = {}
 
 
 class Exporting(NamedTuple):
@@ -59,22 +59,10 @@ class Exported(NamedTuple):
 
 
 class Loading(NamedTuple):
-    """Gives a class loading itself back the arrays a file holds and the load of any value it holds.
-
-    'shared' holds what has already been built from a given part of a file, so a class handed the same bytes twice
-    can share with the first instance what deriving it again would cost.
-    """
+    """Gives a class loading itself back the arrays a file holds and the load of any value it holds."""
 
     array: Callable[[int], np.ndarray]
     value: Callable[..., object]
-    shared: dict
-
-
-class Loaded(NamedTuple):
-    """The arrays one load reads, and what the classes loading themselves have already built from them."""
-
-    values: list[np.ndarray]
-    shared: dict
 
 
 class SerializationMixin:
@@ -103,17 +91,21 @@ class SerializationMixin:
         raise NotImplementedError
 
 
-def register(cls: type, export: Callable, load: Callable) -> None:
+def register(cls: type, export: Callable, load: Callable | None) -> None:
     """Record how a class from another library travels in a file, which lets a file hold a class Genesis does not own.
 
     'export(value, exporting)' returns what JSON can hold and 'load(raw, loading)' gives the value back, both of them
     handed an 'Exporting' or a 'Loading' to put arrays aside and to export or load the values the class holds. A class
     Genesis declares mixes in 'SerializationMixin' and states the same two things as its own methods.
+
+    Without 'load', the class travels as the plain value 'export' returns and loads back as that value. This suits a
+    class that stands for a value Genesis also accepts in its place, such as a model built in memory from a document,
+    whose recreation would read the assets the document names. A value and its plain stand-in then export alike.
     """
     _REGISTERED[cls] = (export, load)
 
 
-def _class_codec(cls) -> tuple[Callable, Callable] | None:
+def _class_codec(cls) -> tuple[Callable, Callable | None] | None:
     """Return the export and load pair for a class.
 
     A self-serialisable class supplies its own methods; otherwise its own or its base's registered pair applies.
@@ -160,29 +152,11 @@ def _field_check(cls: type, name: str) -> TypeAdapter:
     return TypeAdapter(admitted)
 
 
-def _resolve_quoted(hint, namespace: dict):
-    """Returns a declaration holding the classes it names, where Python 3.10 left a quoted name unresolved.
-
-    Until Python 3.11, a name quoted inside a generic - 'list["Joint"]' - stays the string it was written as, and a
-    declaration read as a string states nothing about what it holds.
-    """
-    if not isinstance(hint, types.GenericAlias):
-        return hint
-    args = typing.get_args(hint)
-    return typing.get_origin(hint)[
-        tuple(namespace[arg] if isinstance(arg, str) else _resolve_quoted(arg, namespace) for arg in args)
-    ]
-
-
 def _declared_fields(cls: type) -> dict[str, type]:
     """Return the declared type of each field of a class. Those types drive how a value loads back."""
     if issubclass(cls, Options):
         return {name: info.annotation for name, info in cls.model_fields.items()}
-    hints = typing.get_type_hints(cls)
-    if sys.version_info < (3, 11):
-        namespace = vars(sys.modules[cls.__module__])
-        return {name: _resolve_quoted(hint, namespace) for name, hint in hints.items()}
-    return hints
+    return typing.get_type_hints(cls)
 
 
 def _unwrap_annotation(expect):
@@ -257,9 +231,9 @@ def _has_declared_fields(expect) -> bool:
     )
 
 
-def _layout(cls: type) -> list[str] | dict[str, int]:
+def _layout(cls: type) -> list[str] | dict[str, int | str]:
     """What one class is made of: the value of every member where it enumerates, its field names otherwise."""
-    if issubclass(cls, IntEnum):
+    if issubclass(cls, (IntEnum, StrEnum)):
         return {member.name: member.value for member in cls}
     return sorted(_declared_fields(cls))
 
@@ -292,7 +266,7 @@ def declared_schema(expect: dict) -> dict:
             if not isinstance(declared, type) or declared in seen:
                 continue
             seen.add(declared)
-            if issubclass(declared, IntEnum):
+            if issubclass(declared, (IntEnum, StrEnum)):
                 layout[declared.__name__] = _layout(declared)
             elif _has_declared_fields(declared):
                 for cls in _classes_by_name(declared).values():
@@ -352,11 +326,16 @@ def _store_array(value, exported: "Exported") -> int:
     """
     layout = value.__array_interface__
     key = (layout["data"][0], layout["shape"], layout["strides"], layout["typestr"])
-    slot = exported.slots.get(key)
+    # The address of an empty array is arbitrary (pickle protocol 5 loads every empty array at one address), so keying
+    # it would make the slots depend on how the arrays were created. Each empty array is stored in a slot of its own.
+    # Leaving it out of the file instead would require the manifest to record its shape and dtype, since the manifest
+    # holds nothing but the slot index of each array.
+    slot = exported.slots.get(key) if value.nbytes > 0 else None
     if slot is None:
         slot = len(exported.values)
-        exported.slots[key] = slot
-        exported.stored.append(value)
+        if value.nbytes > 0:
+            exported.slots[key] = slot
+            exported.stored.append(value)
         exported.values.append(np.require(value, requirements="C"))
     return slot
 
@@ -366,9 +345,9 @@ def _exporting_into(exported: "Exported") -> Exporting:
     return Exporting(array=partial(_store_array, exported=exported), value=partial(_export_value, exported=exported))
 
 
-def _loading_from(loaded: "Loaded") -> Loading:
-    """Builds the handle a class receives to load itself back out of this file."""
-    return Loading(array=loaded.values.__getitem__, value=partial(_load_value, loaded=loaded), shared=loaded.shared)
+def _loading_from(loaded: list[np.ndarray]) -> Loading:
+    """Builds the handle a class receives to load itself back out of this file, from the arrays the file holds."""
+    return Loading(array=loaded.__getitem__, value=partial(_load_value, loaded=loaded))
 
 
 def _export_value(value, expect, exported: "Exported"):
@@ -385,14 +364,14 @@ def _export_value(value, expect, exported: "Exported"):
         return _export_any(value, exported)
     if isinstance(value, np.generic):
         return value.item()
-    if isinstance(value, IntEnum):
+    if isinstance(value, (IntEnum, StrEnum)):
         exported.classes.add(type(value))
         return value.name
     codec = _class_codec(type(value))
     if codec is not None:
         held = codec[0](value, _exporting_into(exported))
         # A class saying how it travels may stand where its base is declared, so the file names which one it is.
-        if held is None or _accepted_classes(expect) == (type(value),):
+        if held is None or codec[1] is None or _accepted_classes(expect) == (type(value),):
             return held
         return {"@class": type(value).__name__, "raw": held}
     if _has_declared_fields(expect):
@@ -442,11 +421,12 @@ def _export_any(value, exported: "Exported"):
     # it received rather than a path to read them from.
     codec = _class_codec(type(value))
     if codec is not None:
-        return {"@class": type(value).__name__, "raw": codec[0](value, _exporting_into(exported))}
+        held = codec[0](value, _exporting_into(exported))
+        return held if codec[1] is None else {"@class": type(value).__name__, "raw": held}
     gs.raise_exception(f"A Genesis file cannot hold {type(value).__name__} where 'Any' was declared.")
 
 
-def _load_any(raw, loaded: "Loaded"):
+def _load_any(raw, loaded: list[np.ndarray]):
     """Load back one value declared as 'Any', as what it was exported as."""
     if not isinstance(raw, dict):
         return raw
@@ -465,7 +445,7 @@ def _load_any(raw, loaded: "Loaded"):
     gs.raise_exception(f"A Genesis file holds a value this version cannot load where 'Any' stands: {sorted(raw)}.")
 
 
-def _load_value(raw, expect, loaded: "Loaded"):
+def _load_value(raw, expect, loaded: list[np.ndarray]):
     """Load back one value as the type it is declared to be, creating only what that declaration allows."""
     if raw is None:
         if typing.get_origin(expect) is typing.Annotated:
@@ -476,7 +456,7 @@ def _load_value(raw, expect, loaded: "Loaded"):
     expect = _unwrap_annotation(expect)
     if expect is typing.Any or expect is object:
         return _load_any(raw, loaded)
-    if isinstance(expect, type) and issubclass(expect, IntEnum):
+    if isinstance(expect, type) and issubclass(expect, (IntEnum, StrEnum)):
         return expect[raw]
     if isinstance(raw, dict) and "@class" in raw:
         cls = _classes_by_name(expect).get(raw["@class"])
@@ -617,7 +597,7 @@ def load(path: str | os.PathLike, expect: dict) -> dict:
         with zipfile.ZipFile(path) as archive:
             manifest = json.loads(archive.read(MANIFEST_NAME))
             member = np.load(io.BytesIO(archive.read(ARRAY_MEMBER)))
-            loaded = Loaded(values=[member[str(index)] for index in range(len(member.files))], shared={})
+            loaded = [member[str(index)] for index in range(len(member.files))]
     except zipfile.BadZipFile as e:
         gs.raise_exception_from(f"'{path}' is not a Genesis file, or was truncated on its way here.", e)
     except KeyError as e:

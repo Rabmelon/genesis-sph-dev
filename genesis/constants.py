@@ -22,6 +22,17 @@ class IntEnum(enum.IntEnum):
         return f"<{self.name}: {self.value}>"
 
 
+class StrEnum(enum.StrEnum):
+    """Enumeration of a user-facing option, whose value is the name of its member so that it reads as such in a file."""
+
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return name
+
+    def __repr__(self):
+        return f"<gs.{self.__class__.__name__}.{self.name}>"
+
+
 # geom type in rigid solver
 class GEOM_TYPE(IntEnum):
     # Beware PLANE must be the first geometry type as this is assumed by MPR collision detection.
@@ -48,6 +59,7 @@ class EQUALITY_TYPE(IntEnum):
     CONNECT = 0
     WELD = 1
     JOINT = 2
+    SCREW = 3
 
 
 class CTRL_MODE(IntEnum):
@@ -58,20 +70,20 @@ class CTRL_MODE(IntEnum):
 
 ######### User accessible constants do not capitalize #########
 # rigid solver intergrator
-class integrator(IntEnum):
-    Euler = 0
-    implicitfast = 1
-    approximate_implicitfast = 2
+class integrator(StrEnum):
+    Euler = enum.auto()
+    implicitfast = enum.auto()
+    approximate_implicitfast = enum.auto()
 
 
 # rigid solver constraint solver
-class constraint_solver(IntEnum):
-    CG = 0
-    Newton = 1
+class constraint_solver(StrEnum):
+    CG = enum.auto()
+    Newton = enum.auto()
 
 
 # rigid solver contact friction cone
-class friction_cone(IntEnum):
+class friction_cone(StrEnum):
     """
     Contact friction cone model, trading numerical robustness for physical accuracy.
 
@@ -84,12 +96,12 @@ class friction_cone(IntEnum):
     put at rest instead of slowly creeping.
     """
 
-    pyramidal = 0
-    elliptic = 1
+    pyramidal = enum.auto()
+    elliptic = enum.auto()
 
 
 # rigid solver contact resolution
-class contact_resolution(IntEnum):
+class contact_resolution(StrEnum):
     """
     How a contact's normal force and friction force are resolved against each other.
 
@@ -113,45 +125,47 @@ class contact_resolution(IntEnum):
     Appendix C, whose Signorini condition is what forbids the normal force from absorbing tangential demand.
     """
 
-    convex = 0
-    signorini = 1
+    convex = enum.auto()
+    signorini = enum.auto()
 
 
 # rigid solver broadphase traversal strategy
-class broadphase_traversal(IntEnum):
+class broadphase_traversal(StrEnum):
     """
     Strategy for broad-phase collision detection in the rigid solver.
 
     Broad-phase quickly eliminates geometry pairs that cannot collide before the more expensive narrow-phase runs.
 
     At init time, geometry pairs that can never collide are filtered out (same-link, fixed-vs-fixed, contype/conaffinity
-    mismatch, etc.), producing a list of *valid pairs*.  The number of valid pairs can be up to O(n_geoms^2) but is
-    typically much smaller after filtering.  The two strategies differ in how they search these valid pairs each step:
+    mismatch, etc.), producing a list of *valid pairs*. The geometries of a link keep their pose in the link, so the
+    links are swept first, each with the box bounding all its geometries, and the geometry pairs are only tested under
+    the link pairs whose boxes overlap. The two strategies differ in how they sweep the links each step:
 
     Attributes
     ----------
-    SAP : int
-        Sweep-and-prune.  Sorts geometry AABBs along one axis (O(n_geoms log n_geoms)) then only checks pairs that
-        overlap on that axis.  The sort and sweep are single-threaded, which utilizes GPU cores poorly. However the
-        cost per step is only O(n_geoms log n_geoms + k) where k is the number of axis-overlapping pairs — typically
-        much less than the full set of valid pairs.
-    ALL_VS_ALL : int
-        Checks every valid pair every step (AABB overlap test), dispatching them in parallel across GPU threads.  Cost
-        per step is O(n_valid_pairs) which is efficient on GPU when the pair count is moderate, but becomes expensive
-        in scenes with many geometries since the valid pair count grows quadratically. Does not support heterogeneous
-        entities at this time.
+    SAP : str
+        Sweep-and-prune. Sorts the link boxes along one axis then only checks the link pairs that overlap on that axis.
+        The sort and sweep are single-threaded per environment, which uses GPU cores poorly when there are few
+        environments. The boxes stay nearly sorted from one step to the next, so the sort usually runs in near-linear
+        time, up to O(n_links^2) after a large reordering, and the sweep checks the k link pairs overlapping along
+        the axis.
+    ALL_VS_ALL : str
+        Checks every valid link pair every step, in parallel across GPU threads. The cost per step grows with the number
+        of valid link pairs, which grows quadratically with the number of independent bodies in the scene. With
+        heterogeneous entities, every environment also checks the link pairs of the variants it does not carry.
 
     Notes
     -----
     ``RigidOptions.broadphase_traversal`` defaults to ``None``, which lets the solver choose automatically:
 
-    - **CPU backend** → ``SAP`` (sequential sweep is efficient on CPU).
-    - **GPU backend** → ``ALL_VS_ALL`` (parallel pair checking is faster).
-    - **GPU with heterogeneous entities** → ``SAP`` (``ALL_VS_ALL`` is not compatible with them).
+    - **CPU backend** -> ``SAP`` (sequential sweep is efficient on CPU).
+    - **GPU backend** -> ``ALL_VS_ALL`` (parallel pair checking is faster).
+    - **GPU with heterogeneous entities** -> ``SAP`` (the links of the variants an environment does not carry have
+      empty boxes, which yield no candidate pair).
     """
 
-    SAP = 0
-    ALL_VS_ALL = 1
+    SAP = enum.auto()
+    ALL_VS_ALL = enum.auto()
 
 
 class link_ref_frame(IntEnum):

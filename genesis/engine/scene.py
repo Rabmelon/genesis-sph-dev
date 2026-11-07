@@ -1,5 +1,6 @@
 import collections.abc
 import dataclasses
+import gc
 import hashlib
 import io
 import json
@@ -9,7 +10,9 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
-from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
+from collections.abc import Callable, Iterable
+from functools import cached_property
+from typing import TYPE_CHECKING, BinaryIO, Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -22,10 +25,9 @@ import genesis.utils.mesh as mu
 from genesis.engine.entities.base_entity import Entity, EntityDescription
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.force_fields import ForceField
-from genesis.engine.materials.base import EntityT, Material
+from genesis.engine.materials.base import Material
 from genesis.engine.states.solvers import SimState, SimulatorCheckpoint
 from genesis.options import (
-    SceneOptions,
     BaseCouplerOptions,
     FEMOptions,
     KinematicOptions,
@@ -33,10 +35,9 @@ from genesis.options import (
     PBDOptions,
     ProfilingOptions,
     RigidOptions,
-    SFOptions,
+    SceneOptions,
     SimOptions,
     SPHOptions,
-    ToolOptions,
     ViewerOptions,
     VisOptions,
 )
@@ -48,9 +49,10 @@ from genesis.recorders import RecorderManager
 from genesis.recorders.trajectory import Trajectory, save_checkpoint
 from genesis.repr_base import RBC
 from genesis.utils import serialization
-from genesis.utils.array_class import check_data
+from genesis.utils.data import DataItem, Namespace, check_data, namespace
 from genesis.utils.misc import sanitize_index, tensor_to_array
 from genesis.utils.serialization import ARRAY_MEMBER, MANIFEST_NAME, pixel_less_textures
+from genesis.utils.tools import RunningMean
 from genesis.utils.warnings import warn_once
 from genesis.vis import Visualizer
 
@@ -59,11 +61,13 @@ if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity import RigidEntity
     from genesis.engine.sensors.base_sensor import Sensor
     from genesis.engine.simulator import Simulator
-    from genesis.options.sensors.options import SensorOptions, SensorT
+    from genesis.options.sensors.options import SensorOptions
     from genesis.recorders import Recorder
 
 
 SCENE_FORMAT = ".gscene"
+# The stepping time each sample of the step rate log covers, so that its smoothing spans a fixed time whatever the rate
+STEP_RATE_LOG_INTERVAL = 0.05
 
 
 @dataclasses.dataclass
@@ -111,8 +115,8 @@ def description_digest(desc: SceneDescription) -> str:
     'Scene.load' replaces. Two scenes sharing the digest allocate the same state, so a record of one restores into the
     other. The Genesis version and sources are left out, so a record survives the code moving on.
 
-    The digest exports the description in memory, meshes included, so it is taken once per built scene and once per
-    trajectory opened, never per restore.
+    The digest exports the description in memory, meshes included, so a scene takes it on its first save or restore
+    and keeps it, and a trajectory takes it once when opened.
     """
     defaults = SceneOptions()
     visual = {
@@ -143,8 +147,6 @@ class Scene(RBC):
     ----------
     sim_options : gs.options.SimOptions
         The options configuring the overarching `simulator`, which in turn manages all the solvers.
-    tool_options : gs.options.ToolOptions
-        The options configuring the tool_solver (``scene.sim.ToolSolver``).
     rigid_options : gs.options.RigidOptions
         The options configuring the rigid_solver (``scene.sim.RigidSolver``).
     mpm_options : gs.options.MPMOptions
@@ -153,8 +155,6 @@ class Scene(RBC):
         The options configuring the sph_solver (``scene.sim.SPHSolver``).
     fem_options : gs.options.FEMOptions
         The options configuring the fem_solver (``scene.sim.FEMSolver``).
-    sf_options : gs.options.SFOptions
-        The options configuring the sf_solver (``scene.sim.SFSolver``).
     pbd_options : gs.options.PBDOptions
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
     coupler_options : gs.options.CouplerOptions
@@ -177,13 +177,11 @@ class Scene(RBC):
     def __init__(
         self,
         sim_options: SimOptions | None = None,
-        tool_options: ToolOptions | None = None,
         rigid_options: RigidOptions | None = None,
         kinematic_options: KinematicOptions | None = None,
         mpm_options: MPMOptions | None = None,
         sph_options: SPHOptions | None = None,
         fem_options: FEMOptions | None = None,
-        sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
         coupler_options: BaseCouplerOptions | None = None,
         vis_options: VisOptions | None = None,
@@ -199,13 +197,11 @@ class Scene(RBC):
 
         individual_options = (
             sim_options,
-            tool_options,
             rigid_options,
             kinematic_options,
             mpm_options,
             sph_options,
             fem_options,
-            sf_options,
             pbd_options,
             coupler_options,
             vis_options,
@@ -220,13 +216,11 @@ class Scene(RBC):
         else:
             self.options = SceneOptions(
                 sim=sim_options,
-                tool=tool_options,
                 rigid=rigid_options,
                 kinematic=kinematic_options,
                 mpm=mpm_options,
                 sph=sph_options,
                 fem=fem_options,
-                sf=sf_options,
                 pbd=pbd_options,
                 coupler=coupler_options,
                 vis=vis_options,
@@ -241,8 +235,14 @@ class Scene(RBC):
         # description
         self._desc = SceneDescription(options=self.options)
 
-        # simulator
-        self._sim = Simulator(scene=self, options=self.options)
+        # simulator, its components opting in the data of one another within the namespace of the scene (see Namespace)
+        self._namespace = Namespace("scene")
+        with namespace(self._namespace):
+            self._sim = Simulator(scene=self, options=self.options)
+        # The smoothed step rate the log reports, and the steps and stepping time of the sample being gathered
+        self._step_rate_mean = RunningMean(alpha=self.options.profiling.FPS_tracker_alpha)
+        self._n_sample_steps = 0
+        self._sample_periods_sum = 0.0
 
         # visualizer
         self._visualizer = Visualizer(
@@ -259,12 +259,8 @@ class Scene(RBC):
         # emitters
         self._emitters = gs.List()
 
-        self._backward_ready = False
-        self._forward_ready = False
-
         self._uid = gs.UID()
         self._is_built = False
-        self._desc_digest: str | None = None
         self._pre_step_callbacks: list = []
 
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
@@ -294,6 +290,14 @@ class Scene(RBC):
             if getattr(self, "_sim", None) is not None:
                 self._sim.destroy()
                 self._sim = None
+                # The opt-in requests of the namespace hold callables bound to the components of the simulator, which
+                # would keep its data alive with the scene (see 'opt_in').
+                self._namespace = None
+
+                # Reference cycles leave the Quadrants arrays of the simulator to a later garbage collection, which
+                # aborts the process if it runs on a thread without their CUDA context, e.g. the viewer render thread.
+                # FIXME: quadrants#981 - Quadrants frees device memory without making its CUDA context current.
+                gc.collect()
 
             # The viewer plugins stopped by the visualizer still require a built scene
             self._is_built = False
@@ -310,7 +314,7 @@ class Scene(RBC):
     ) -> "RigidEntity": ...
 
     @overload
-    def add_entity(
+    def add_entity[EntityT: "Entity"](
         self,
         morph: Morph | Iterable[Morph],
         material: Material[EntityT] = ...,
@@ -336,9 +340,12 @@ class Scene(RBC):
         Parameters
         ----------
         morph : gs.morphs.Morph | list[gs.morphs.Morph]
-            The morph of the entity. If a list of morphs is provided, the entity will be heterogeneous
-            (rigid only, single-link entities only). Each parallel environment will simulate a different
-            geometry variant from the list.
+            The morph of the entity. If a list of morphs is provided, the entity is heterogeneous (rigid and kinematic
+            entities only): each parallel environment simulates one of them, the environments being split into
+            contiguous blocks of nearly equal size. The morphs must share their kinematic topology (the same links,
+            connected by joints of the same names, types and numbers of degrees of freedom), while their geometry,
+            inertia, link frames (e.g. a different 'scale', or a different pose for a fixed base) and joint parameters
+            may differ.
         material : gs.materials.Material | None, optional
             The material of the entity. If None, use ``gs.materials.Rigid()``.
         surface : gs.surfaces.Surface | None, optional
@@ -382,7 +389,7 @@ class Scene(RBC):
         if vis_mode is not None:
             surface.vis_mode = vis_mode
         # validate and populate default surface.vis_mode considering morph type
-        if isinstance(material, (gs.materials.Kinematic, gs.materials.Tool)):
+        if isinstance(material, gs.materials.Kinematic):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
@@ -409,15 +416,6 @@ class Scene(RBC):
                 surface.vis_mode = "particle"
 
             if surface.vis_mode not in ("particle", "recon"):
-                gs.raise_exception(
-                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
-                )
-
-        elif isinstance(material, gs.materials.SF.Smoke):
-            if surface.vis_mode is None:
-                surface.vis_mode = "particle"
-
-            if surface.vis_mode not in ("particle",):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
@@ -485,7 +483,7 @@ class Scene(RBC):
 
         Returns
         -------
-        entities : List[genesis.Entity]
+        entities : list[genesis.Entity]
             The created entities.
         """
         if not isinstance(morph, gs.morphs.USD):
@@ -583,7 +581,7 @@ class Scene(RBC):
         self.visualizer.add_light(pos, dir, color, intensity, directional, castshadow, cutoff, attenuation)
 
     @gs.assert_unbuilt
-    def add_sensor(self, sensor_options: "SensorOptions[SensorT]") -> "SensorT":
+    def add_sensor[SensorT: "Sensor"](self, sensor_options: "SensorOptions[SensorT]") -> SensorT:
         """
         Add a sensor to the scene.
 
@@ -594,7 +592,8 @@ class Scene(RBC):
         sensor_options : SensorOptions
             The options for the sensor.
         """
-        return self._sim._sensor_manager.create_sensor(sensor_options)
+        with namespace(self._namespace):
+            return self._sim._sensor_manager.create_sensor(sensor_options)
 
     @gs.assert_built
     def read_sensors(self, envs_idx=None) -> "dict[type[Sensor], torch.Tensor]":
@@ -611,7 +610,7 @@ class Scene(RBC):
 
         Returns
         -------
-        dict[Type[Sensor], torch.Tensor]
+        dict[type[Sensor], torch.Tensor]
             For each sensor class present in the scene, a tensor of shape (B, [history,] class_cache_size).
         """
         return self._sim._sensor_manager.read_sensors(entity_idx=None, envs_idx=envs_idx)
@@ -868,31 +867,32 @@ class Scene(RBC):
         with gs.logger.timer(f"Building scene ~~~<{self._uid}>~~~..."):
             self._parallelize(n_envs, env_spacing, n_envs_per_row, center_envs_at_origin)
 
-            # simulator
-            self._sim.build()
+            with namespace(self._namespace):
+                self._sim.build()
 
             # reset state
             self._reset()
 
-            # The description is fixed once built, so its digest is taken once (see 'description_digest')
-            self._desc_digest = description_digest(self._desc)
             self._is_built = True
 
         with gs.logger.timer("Compiling simulation kernels..."):
             self._sim.step()
-            if self._sim.rigid_solver.is_active:
-                try:
-                    self._sim.rigid_solver.check_errno()
-                except gs.GenesisException:
-                    self.destroy()
-                    raise
+            try:
+                self._sim.check_errno()
+            except gs.GenesisException as e:
+                gs.logger.warning(
+                    "The initial state is invalid. Register a valid one with 'scene.reset(state)', or overwrite it "
+                    "manually following 'scene.build' and every call to 'scene.reset()', otherwise stepping will fail "
+                    f"with: {e}"
+                )
             self._reset()
 
         # visualizer
         with gs.logger.timer("Building visualizer..."):
             self._visualizer.build()
 
-        # recorders
+        # recorders, which lay out the phases a step times once (see 'StepTimer.add_phases')
+        self._sim.step_timer.add_phases("recorders", "rendering", "video")
         self._recorder_manager.build()
 
     def _parallelize(
@@ -983,32 +983,30 @@ class Scene(RBC):
             self._init_state = self._get_state()
         self._restart()
 
-    def _restart(self):
-        """Restart what surrounds the state: the gradient tape, the cache of the visualizer and the emitters."""
-        self._forward_ready = True
-        self._reset_grad()
+    def _restart(self, refresh_viewer=True):
+        """Restart what surrounds the state: the cache of the visualizer and the emitters.
 
+        'refresh_viewer' repaints the interactive viewer right away (see 'Visualizer.reset').
+        """
         # Clear the entire cache of the visualizer.
         # TODO: Could be optimized to only clear cache associated the the environments being reset.
         if self._visualizer.is_built:
-            self._visualizer.reset()
+            self._visualizer.reset(refresh_viewer)
 
         # TODO: sets _next_particle = 0; not sure this is env isolation safe
         for emitter in self._emitters:
             emitter.reset()
-
-    def _reset_grad(self):
-        self._backward_ready = True
 
     @gs.assert_built
     def backward(self, loss: torch.Tensor, *args, **kwargs):
         """
         Differentiates `loss` through the recorded rollout and restores the pre-backward physics state.
 
-        Unrolling the gradient tape rewinds the physics state to step 0, so this method snapshots the current state
-        first, runs the backward pass, and restores the snapshot afterwards. The scene then sits at the same physics
-        state as before the call, with gradients populated and forward / backward re-armed, ready to continue the
-        rollout or to be reset. The registered initial state (`reset()` with no argument) is preserved.
+        The backward pass of each step restores the state the step started from, which rewinds the physics state to the
+        first step the loss reaches, so this method snapshots the current state first, runs the backward pass, and
+        restores the snapshot afterwards. The scene then sits at the same physics state as before the call, with
+        gradients populated and forward / backward re-armed, ready to continue the rollout or to be reset. The
+        registered initial state (`reset()` with no argument) is preserved.
 
         Parameters
         ----------
@@ -1021,38 +1019,36 @@ class Scene(RBC):
         snapshot : SimState
             The physics state the scene was restored to.
         """
-        # Snapshot the current state before the gradient-tape unroll rewinds physics to step 0. The clocks go with
-        # it: the unroll winds them down step by step, and the restore below puts the physics back where they were.
-        snapshot = self.get_state()
+        # Snapshot the current state before the backward pass rewinds the physics. The clocks go with it: the backward
+        # pass of each step winds them down, and the restore below puts the physics back where they were.
+        snapshot = self._get_state()
         steps = self._sim._steps.clone()
-        # The sim unroll (self._backward) re-enters the torch graph from each step's queried states, so the graph
-        # must survive the initial autograd pass.
-        if kwargs.setdefault("retain_graph", True) is not True:
-            gs.raise_exception("'retain_graph' must be left unset: scene.backward requires the graph to survive.")
-        # The functional torch.autograd.backward fills torch and queried-state grads while leaving the sim unroll to
-        # the explicit self._backward call below, keeping gs.Tensor.backward's automatic scene._backward out of it.
+        # The autograd nodes of the steps unroll the rollout within this backward pass (see genesis.grad.bridge).
         torch.autograd.backward(loss, *args, **kwargs)
-        self._backward()
         # keep_init semantics: see _reset. Restoring the snapshot puts the physics back where the forward pass left
-        # it, so the clocks snapshotted above are put back with it rather than left at zero.
+        # it, and the clocks snapshotted above with it.
         self._reset(snapshot, keep_init=True)
         self._sim._steps[:] = steps
         return snapshot
 
     def _get_state(self):
-        return self._sim.get_state()
+        # The scene keeps this state for itself, outside of the autograd graph of a differentiable rollout
+        with torch.no_grad():
+            return self._sim.get_state()
 
     @gs.assert_built
     def get_state(self):
         """
         Returns the current state of the scene.
 
+        In a differentiable scene, the state tracks gradients, as the getters of the entities do.
+
         Returns
         -------
         state : genesis.SimState
             The state of the scene at the current time step.
         """
-        return self._get_state()
+        return self._sim.get_state()
 
     def register_pre_step_callback(self, callback):
         """Register a callback invoked at the start of each ``step()``, on the stepping thread. A callback
@@ -1069,30 +1065,64 @@ class Scene(RBC):
         # frame's advance by returning True. The scene treats them opaquely, without knowing what they do or who
         # registered them (e.g. an InteractiveScene driving GUI-requested rebuild/pause). The visualizer is still
         # refreshed when the advance is vetoed, so the viewer keeps rendering and stays responsive while paused.
-        fps_tracker = self._sim.fps_tracker
-        fps_tracker.start()
+        step_timer = self._sim.step_timer
+        step_timer.start()
         advance = not any([callback() for callback in tuple(self._pre_step_callbacks)])
 
         if advance:
-            if not self._forward_ready:
+            if not self._sim.is_forward_ready:
                 gs.raise_exception("Forward simulation not allowed after backward pass. Please reset scene state.")
             # The recorders read the state a step starts from, with the inputs the step consumes: 'Simulator.step'
             # zeroes the applied forces at its end. The pre-step callbacks ran, so their inputs are read as well.
-            with fps_tracker.phase("recorders"):
+            # The recorders read the state for themselves, outside of the autograd graph of a differentiable rollout
+            with step_timer.phase("recorders"), torch.no_grad():
                 self._recorder_manager.step(self._sim.cur_step_global)
             self._sim.step()
 
         if update_visualizer:
-            # Force the refresh when the sim did not advance (e.g. paused) so edits made off the step loop -
-            # like a GUI joint slider calling set_qpos - are still drawn and the viewer does not appear frozen.
-            with fps_tracker.phase("rendering"):
-                self._visualizer.update(force=not advance, auto=refresh_visualizer)
+            with step_timer.phase("rendering"):
+                self._visualizer.update_on_sim_step(advanced=advance, auto=refresh_visualizer)
 
-        if advance:
-            with fps_tracker.phase("video"):
-                for camera in self._visualizer.cameras:
-                    camera.update_recording()
-        fps_tracker.step(count=advance)
+        # A vetoed step never happened for the timings: the next 'start' discards the one it opened
+        if not advance:
+            return
+        with step_timer.phase("video"):
+            for camera in self._visualizer.cameras:
+                camera.update_recording()
+        step_timer.step()
+        # The step rate the loop achieves is the inverse of the period of its steps (see 'StepTimer'), sampled over
+        # STEP_RATE_LOG_INTERVAL of stepping and logged for every environment and per environment
+        period = step_timer.timings.get("period")
+        if self.options.profiling.show_FPS and period is not None:
+            self._n_sample_steps += 1
+            self._sample_periods_sum += period
+            if self._sample_periods_sum >= STEP_RATE_LOG_INTERVAL:
+                self._step_rate_mean.update(self._n_sample_steps / self._sample_periods_sum)
+                self._n_sample_steps = 0
+                self._sample_periods_sum = 0.0
+                rate = self._step_rate_mean.value
+                if self.n_envs > 0:
+                    gs.logger.info(
+                        f"Running at ~<{rate * self.n_envs:,.2f}>~ FPS "
+                        f"(~<{rate:.2f}>~ FPS per env, ~<{self.n_envs}>~ envs)."
+                    )
+                else:
+                    gs.logger.info(f"Running at ~<{rate:.2f}>~ FPS.")
+
+    @gs.assert_built
+    def get_error_envs_mask(self) -> torch.Tensor:
+        """
+        Return whether each environment flagged an error since its last reset, such as an overflow of contacts or a 'nan'.
+
+        A flagged error raises at the beginning of the next step, before anything else, until it is cleared: by resetting
+        the state of the environment, or with 'clear_errno'.
+        """
+        return self._sim.get_error_envs_mask()
+
+    @gs.assert_built
+    def clear_errno(self, envs_idx=None):
+        """Clear the errors flagged for the given environments, all of them if None (see 'get_error_envs_mask')."""
+        self._sim.clear_errno(envs_idx)
 
     def stop_recording(self):
         # The recorders read before each step, so the state the last step left is recorded here, whatever the
@@ -1101,10 +1131,6 @@ class Scene(RBC):
             self._recorder_manager.record(self._sim.cur_step_global)
         finally:
             self._recorder_manager.stop()
-
-    def _step_grad(self):
-        self._sim.collect_output_grads()
-        self._sim._step_grad()
 
     @gs.assert_built
     def draw_debug_line(self, start, end, radius=0.002, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1128,7 +1154,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_line(start, end, radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_line(start, end, radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_arrow(self, pos, vec=(0, 0, 1), radius=0.01, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1152,7 +1180,10 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_arrow(pos, vec, radius, color)
+            node = self._visualizer.context.make_debug_arrow(pos, vec, radius, color)
+            if node is not None:
+                self._visualizer.context.add_debug_node(node)
+            return node
 
     @gs.assert_built
     def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01, color=None):
@@ -1178,7 +1209,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_frame(T, axis_length, origin_size, axis_radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_frames(self, Ts, axis_length=1.0, origin_size=0.015, axis_radius=0.01, color=None):
@@ -1204,7 +1237,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frames(Ts, axis_length, origin_size, axis_radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_frames(Ts, axis_length, origin_size, axis_radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_mesh(self, mesh, pos=np.zeros(3), T=None):
@@ -1226,7 +1261,7 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_mesh(mesh, pos, T)
+            return self._visualizer.context.add_debug_node(self._visualizer.context.make_debug_mesh(mesh, pos, T))
 
     @gs.assert_built
     def draw_debug_sphere(self, pos, radius=0.01, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1248,7 +1283,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_sphere(pos, radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_sphere(pos, radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_spheres(self, poss, radius=0.01, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1270,7 +1307,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_spheres(poss, radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_spheres(poss, radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_box(
@@ -1300,8 +1339,10 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_box(
-                bounds, color, wireframe=wireframe, wireframe_radius=wireframe_radius
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_box(
+                    bounds, color, wireframe=wireframe, wireframe_radius=wireframe_radius
+                )
             )
 
     @gs.assert_built
@@ -1322,7 +1363,7 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_points(poss, colors)
+            return self._visualizer.context.add_debug_node(self._visualizer.context.make_debug_points(poss, colors))
 
     @gs.assert_built
     def draw_debug_frustum(self, camera, color=(1.0, 1.0, 1.0, 0.3)):
@@ -1344,7 +1385,9 @@ class Scene(RBC):
         """
         with self._visualizer.viewer_lock:
             mesh = mu.create_camera_frustum(camera, color)
-            return self._visualizer.context.draw_debug_mesh(mesh, T=camera.transform)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_mesh(mesh, T=camera.transform)
+            )
 
     @gs.assert_built
     def draw_debug_trajectory(self, poss, radius=0.002, color=(1.0, 0.5, 0.0, 0.8)):
@@ -1373,7 +1416,7 @@ class Scene(RBC):
         segments = [mu.create_line(poss[i], poss[i + 1], radius, color) for i in range(len(poss) - 1)]
         merged = trimesh.util.concatenate(segments)
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_mesh(merged)
+            return self._visualizer.context.add_debug_node(self._visualizer.context.make_debug_mesh(merged))
 
     @gs.assert_built
     def draw_debug_path(self, qposs, entity, link_idx=-1, density=0.3, frame_scaling=1.0):
@@ -1418,8 +1461,10 @@ class Scene(RBC):
                 pos, quat = self.rigid_solver.forward_kinematics_query(entity, qposs[indices[i]])
                 Ts[i] = tensor_to_array(gu.trans_quat_to_T(pos[link_idx], quat[link_idx]))
 
-            return self._visualizer.context.draw_debug_frames(
-                Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_frames(
+                    Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
+                )
             )
 
     @gs.assert_built
@@ -1498,22 +1543,6 @@ class Scene(RBC):
         """
         with self._visualizer.viewer_lock:
             self._visualizer.context.clear_debug_objects()
-
-    def _backward(self):
-        """
-        At this point, all the scene states the simulation run should have been filled with gradients.
-        Next, we run backward from scene state back to scene's internal# Quadrants variables, then back through time.
-        """
-
-        if not self._backward_ready:
-            gs.raise_exception("Multiple backward calls not allowed.")
-
-        # backward pass through time
-        while self._sim.cur_step_global > 0:
-            self._step_grad()
-
-        self._backward_ready = False
-        self._forward_ready = False
 
     @gs.assert_built
     def get_time(self, envs_idx=None):
@@ -1795,8 +1824,8 @@ class Scene(RBC):
         The scene must be built from the description the state was read from, with the same environment layout, since
         the arrays written back are the ones that build allocates. A state from another layout is rejected, and a state
         from another build by the names of the arrays that differ. Everything around the state restarts as under
-        'reset': the gradient tape, the sensors and the recorders forget the run that led here, and the visualizer
-        redraws.
+        'reset': the autograd graph of the rollout, the sensors and the recorders forget the run that led here, and the
+        visualizer redraws, the interactive viewer when a refresh is due.
 
         Parameters
         ----------
@@ -1818,13 +1847,15 @@ class Scene(RBC):
             )
         for name, solver in solvers.items():
             record = state.sim.solvers[name]
-            check_data((item for item in solver.data if item.kind in record.kinds), record.arrays)
+            items = (item for item in solver.data if isinstance(item, DataItem) and item.kind in record.kinds)
+            check_data(items, record.arrays)
         # The recorders finish the run first (see 'reset'), and the restart follows the state, so the visualizer draws
         # the state put back.
         self._recorder_manager.record(self._sim.cur_step_global)
         self._recorder_manager.reset()
         self._sim.__setstate__(state.sim)
-        self._restart()
+        # The restored state is rendered at the scheduled framerate without forcing immediate refresh, as after a step
+        self._restart(refresh_viewer=False)
 
     def _sanitize_envs_idx(
         self, envs_idx: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None
@@ -1874,22 +1905,27 @@ class Scene(RBC):
 
     @property
     def timings(self):
-        """Wall time in seconds of the phases of a call to `step`, averaged over the latest `timings_window` steps
-        (see ProfilingOptions) among the steps that ran the phase, keyed by phase:
+        """Wall time in seconds of every phase of the latest call to `step` that advanced the simulation, by phase.
+
+        The phases are:
 
         - physics: the solvers advancing the state over the substeps.
         - sensors: the sensor updates, and sensors/<class name> the share of each sensor class.
         - rendering: the viewer refresh.
         - recorders: the recorders reading the state.
         - video: the cameras rendering and encoding the frame of a recording.
-        - total: the whole step, the pre-step callbacks included.
+        - step: the whole call to `step`, the pre-step callbacks included.
+        - period: the wall time from the start of the previous call to `step` that advanced the simulation to the start
+          of this one, the time spent between the two included, so its inverse is the step rate the loop achieves.
 
-        A phase the step left out (the simulation vetoed by a pre-step callback, the visualizer update skipped) is
-        absent from that step, so the mapping is empty before the first step. On the GPU backends a phase covers the
-        host work of launching its kernels, which the device completes asynchronously, so the phases split the step on
-        the CPU backend and the total holds on every backend once a step reads the device back.
+        A phase the step left out (the visualizer update skipped) is absent. A step a pre-step callback vetoed never
+        happened for the timings, which it leaves as they were. The mapping is empty before the first step, and the
+        first step has no `period`. The values are raw, so a quantity read from them every step is smoothed with a
+        `RunningMean` (in genesis.utils.tools). On the GPU backends a phase covers the host work of launching its
+        kernels, which the device completes asynchronously, so the phases split the step on the CPU backend, and `step`
+        holds on every backend once it reads the device back.
         """
-        return self._sim.fps_tracker.timings
+        return self._sim.step_timer.timings
 
     @property
     def requires_grad(self):
@@ -1959,6 +1995,11 @@ class Scene(RBC):
         """
         return self._desc
 
+    @cached_property
+    def _desc_digest(self) -> str:
+        """The digest of this scene's description (see 'description_digest'), which a saved state must share."""
+        return description_digest(self._desc)
+
     def get_entity(self, name: str | None = None, *, uid: str | None = None) -> "Entity":
         """
         Get an entity by name or UID. Raises an exception if not found.
@@ -1994,11 +2035,6 @@ class Scene(RBC):
     def emitters(self):
         """All the emitters in the scene."""
         return self._emitters
-
-    @property
-    def tool_solver(self):
-        """The scene's `tool_solver`, managing all the `ToolEntity` in the scene."""
-        return self._sim.tool_solver
 
     @property
     def rigid_solver(self):

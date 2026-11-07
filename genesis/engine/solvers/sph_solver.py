@@ -11,14 +11,14 @@ from genesis.engine.materials import SPH
 from genesis.engine.states.solvers import SPHSolverState
 from genesis.utils.misc import qd_to_numpy
 
-from .base_solver import GravityMixin, Solver, TimeBasedMixin
+from .particle_solver import ParticleSolver
 
 if TYPE_CHECKING:
     from genesis.engine.entities import SPHEntity
 
 
 @qd.data_oriented
-class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
+class SPHSolver(ParticleSolver):
     material_cls = SPH.Base
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
@@ -153,12 +153,6 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 gs.qd_mat3, shape=(self._n_particles_total, self._B), layout=qd.Layout.SOA
             )
 
-    def init_ckpt(self):
-        self._ckpt = dict()
-
-    def reset_grad(self):
-        pass
-
     def build(self):
         super().build()
 
@@ -191,9 +185,8 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                     "simulated particles."
                 )
 
-            self.sh.build(self._B)
+            self.sh.build(self._n_particles_total, self._B)
             self.init_particle_fields()
-            self.init_ckpt()
 
             for entity in self.entities:
                 entity._add_to_solver()
@@ -241,7 +234,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self._density0 = self.particles_info[0].rho
 
         # Kernels of this solver take the solver itself, so gravity has to be a field for them.
-        self._build_gravity(as_field=True)
+        self._build_gravity()
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- misc ----------------------------------------
@@ -1061,14 +1054,6 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------ stepping --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def process_input(self, in_backward=False):
-        for entity in self.entities:
-            entity.process_input(in_backward=in_backward)
-
-    def process_input_grad(self):
-        for entity in self.entities[::-1]:
-            entity.process_input_grad()
-
     def substep_pre_coupling(self, f):
         if self.is_active:
             self._kernel_reorder_particles(f)
@@ -1088,44 +1073,18 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
                 self._kernel_compute_rho(f)
                 self._kernel_compute_DFSPH_factor(f)
                 self._divergence_solve(f)
-                self._kernel_advect_velocity(f)
                 self._kernel_compute_non_pressure_forces(f, self._sim.cur_t)
                 self._kernel_predict_velocity(f)
                 self._density_solve(f)
-
-    def substep_pre_coupling_grad(self, f):
-        pass
 
     def substep_post_coupling(self, f):
         if self.is_active:
             self._kernel_advect_position(f)
             self._kernel_copy_from_reordered(f)
 
-    def substep_post_coupling_grad(self, f):
-        pass
-
-    # ------------------------------------------------------------------------------------
-    # ------------------------------------ gradient --------------------------------------
-    # ------------------------------------------------------------------------------------
-
-    def collect_output_grads(self):
-        """
-        Collect gradients from downstream queried states.
-        """
-        pass
-
-    def add_grad_from_state(self, state):
-        pass
-
     # ------------------------------------------------------------------------------------
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
-
-    def save_ckpt(self, ckpt_name):
-        pass
-
-    def load_ckpt(self, ckpt_name):
-        pass
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
@@ -1198,7 +1157,7 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles_render[i_p, i_b].active = is_rendered
 
     @qd.kernel
-    def _kernel_add_particles(
+    def add_particles(
         self,
         f: qd.i32,
         active: qd.i32,
@@ -1293,21 +1252,19 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
-            for i in qd.static(range(3)):
-                self.particles[i_p, i_b].pos[i] = poss[i_b_, i_p_, i]
-            self.particles[i_p, i_b].vel.fill(0.0)
-            self.particles[i_p, i_b].acc.fill(0.0)
+            # The earlier occurrences of a repeated particle are -1 (see 'drop_repeated_index')
+            if i_p >= 0:
+                for i in qd.static(range(3)):
+                    self.particles[i_p, i_b].pos[i] = poss[i_b_, i_p_, i]
+                self.particles[i_p, i_b].vel.fill(0.0)
+                self.particles[i_p, i_b].acc.fill(0.0)
 
     @qd.kernel
     def _kernel_get_particles_pos(
-        self,
-        particle_start: qd.i32,
-        n_particles: qd.i32,
-        envs_idx: qd.types.ndarray(),
-        poss: qd.types.ndarray(),
+        self, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), poss: qd.types.ndarray()
     ):
-        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
-            i_p = i_p_ + particle_start
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
             for i in qd.static(range(3)):
                 poss[i_b_, i_p_, i] = self.particles[i_p, i_b].pos[i]
@@ -1322,20 +1279,18 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
-            for i in qd.static(range(3)):
-                self.particles[i_p, i_b].vel[i] = vels[i_b_, i_p_, i]
-            self.particles[i_p, i_b].acc = qd.Vector.zero(gs.qd_float, 3)
+            # See '_kernel_set_particles_pos'
+            if i_p >= 0:
+                for i in qd.static(range(3)):
+                    self.particles[i_p, i_b].vel[i] = vels[i_b_, i_p_, i]
+                self.particles[i_p, i_b].acc = qd.Vector.zero(gs.qd_float, 3)
 
     @qd.kernel
     def _kernel_get_particles_vel(
-        self,
-        particle_start: qd.i32,
-        n_particles: qd.i32,
-        envs_idx: qd.types.ndarray(),
-        vels: qd.types.ndarray(),
+        self, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), vels: qd.types.ndarray()
     ):
-        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
-            i_p = i_p_ + particle_start
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
             for i in qd.static(range(3)):
                 vels[i_b_, i_p_, i] = self.particles[i_p, i_b].vel[i]
@@ -1350,31 +1305,26 @@ class SPHSolver(GravityMixin, TimeBasedMixin, Solver):
         for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
-            self.particles_ng[i_p, i_b].active = actives[i_b_, i_p_]
+            # See '_kernel_set_particles_pos'
+            if i_p >= 0:
+                self.particles_ng[i_p, i_b].active = actives[i_b_, i_p_]
 
     @qd.kernel
     def _kernel_get_particles_active(
-        self,
-        particle_start: qd.i32,
-        n_particles: qd.i32,
-        envs_idx: qd.types.ndarray(),
-        actives: qd.types.ndarray(),  # shape [B, n_particles]
+        self, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), actives: qd.types.ndarray()
     ):
-        for i_p_, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
-            i_p = i_p_ + particle_start
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
             actives[i_b_, i_p_] = self.particles_ng[i_p, i_b].active
 
     @qd.kernel
-    def _kernel_get_mass(
-        self, particle_start: qd.i32, n_particles: qd.i32, mass: qd.types.ndarray(), envs_idx: qd.types.ndarray()
+    def _kernel_get_particles_mass(
+        self, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), masses: qd.types.ndarray()
     ):
-        total_mass = gs.qd_float(0.0)
-        for i_p_ in range(n_particles):
-            i_p = i_p_ + particle_start
-            total_mass += self.particles_info[i_p].mass
-        for i_b_ in range(envs_idx.shape[0]):
-            mass[i_b_] = total_mass
+        for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            masses[i_b_, i_p_] = self.particles_info[i_p].mass
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------

@@ -6,11 +6,10 @@ import genesis.utils.geom as gu
 from genesis.utils.misc import qd_to_numpy
 
 
-@pytest.mark.required
 @pytest.mark.parametrize(
     "n_envs, pressure_solver",
     [
-        (0, "WCSPH"),
+        pytest.param(0, "WCSPH", marks=pytest.mark.required),
         (0, "DFSPH"),
         pytest.param(2, "WCSPH", marks=pytest.mark.slow),  # ~150s
         pytest.param(2, "DFSPH", marks=pytest.mark.slow),  # ~300s
@@ -78,8 +77,9 @@ def test_rigid_flotation_follows_density_ratio(n_envs, pressure_solver, show_vie
     )
     scene.build(n_envs=n_envs)
 
+    # The light ball first sinks with the settling fluid before buoyancy lifts it above the surface
     raft_rolls = []
-    for _ in range(50):
+    for _ in range(100):
         scene.step()
         raft_rolls.append(gu.quat_to_xyz(raft.get_quat(), rpy=True, degrees=True)[..., 0])
     raft_rolls = torch.stack(raft_rolls)
@@ -96,8 +96,7 @@ def test_rigid_flotation_follows_density_ratio(n_envs, pressure_solver, show_vie
     assert (raft_rolls.amax(dim=0) - raft_rolls.amin(dim=0) > 2.0).all(), f"Raft must rock, got rolls={raft_rolls}"
 
 
-@pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0, 2])
+@pytest.mark.parametrize("n_envs", [0, pytest.param(2, marks=pytest.mark.required)])
 def test_coupling_force_wakes_hibernated_link(n_envs, show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(

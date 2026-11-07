@@ -143,6 +143,7 @@ def test_urdf_scale(mesh_urdf, show_viewer):
 # ==================== Y-Up Coordinate Tests ====================
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_mesh_yup(show_viewer):
     scene = gs.Scene(show_viewer=show_viewer)
@@ -255,8 +256,14 @@ def test_urdf_yup(file_meshes_are_zup, mesh_urdf, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("mesh_file", ["1707/base_link.stl"])
-def test_urdf_mesh_processing(mesh_path, mesh_urdf, show_viewer):
+@pytest.mark.parametrize(
+    "mesh_file, color",
+    [
+        ("1707/base_link.stl", (255, 255, 255, 255)),
+        ("allegro_hand/meshes/visual/link_3.0.obj", (1, 1, 1, 255)),
+    ],
+)
+def test_urdf_mesh_processing(mesh_path, mesh_urdf, color, show_viewer):
     scene = gs.Scene(
         show_viewer=show_viewer,
         show_FPS=False,
@@ -282,6 +289,11 @@ def test_urdf_mesh_processing(mesh_path, mesh_urdf, show_viewer):
 
     tmesh = trimesh.Trimesh(vertices=tmesh_obj_vis.vertices, faces=tmesh_obj_vis.faces, process=True)
     assert len(tmesh.vertices) != len(tmesh_obj_vis.vertices)
+
+    # An OBJ takes its color from its material library, reached through a symlink of the Hugging Face cache, and an STL
+    # takes the default color
+    for vgeom in (obj.vgeoms[0], robot.vgeoms[0]):
+        assert_equal(vgeom.vmesh.trimesh.visual.vertex_colors, color)
 
 
 @pytest.mark.required
@@ -366,20 +378,39 @@ def test_glb_draco_missing_normals_texcoord(glb_file):
 
 
 @pytest.mark.required
-def test_glb_texcoord(emissive_material_variants_glb):
-    # Material 0 reads the float set 0 and material 1 the normalized set 1, so both meshes carry the authored UVs
+def test_glb_material_variants(material_variants_glb):
     gs_meshes = gltf_utils.parse_mesh_glb(
-        emissive_material_variants_glb,
+        material_variants_glb,
         group_by_material=True,
         scale=None,
         is_mesh_zup=True,
         surface=gs.surfaces.Default(),
     )
-    assert len(gs_meshes) == 2
-    # V is flipped to the image-space convention
+    assert len(gs_meshes) == 6
+
+    # Material 0 reads the float set 0 and material 1 the normalized set 1, so every mesh carries the authored UVs,
+    # with V flipped to the image-space convention
     expected_uvs = np.array([[0.125, 0.75], [0.375, 0.5], [0.625, 0.25]], dtype=np.float32)
     for gs_mesh in gs_meshes:
         assert_allclose(gs_mesh.trimesh.visual.uv, expected_uvs, tol=1.0 / np.iinfo(np.uint16).max)
+
+    # A masked material splits the alpha ramp at its cutoff, taken after the alpha factor: 0.6 of full opacity is
+    # 153, between the third and the fourth texel, and a factor of 0.6 leaves only the last texel at 0.5 or above.
+    # A blended material keeps the ramp and an opaque one discards it.
+    expected_opacities = {
+        "masked": [0, 0, 0, 255, 255],
+        "masked_factor": [0, 0, 0, 0, 255],
+        "blended": [0, 64, 128, 192, 255],
+        "opaque": [255, 255, 255, 255, 255],
+    }
+    opacities = {
+        gs_mesh.metadata["name"]: gs_mesh.surface.opacity_texture.image_array[0]
+        for gs_mesh in gs_meshes
+        if gs_mesh.metadata["name"] in expected_opacities
+    }
+    assert opacities.keys() == expected_opacities.keys()
+    for material_name, expected in expected_opacities.items():
+        assert_equal(opacities[material_name], expected, err_msg=material_name)
 
 
 # ==================== Material/Texture Parsing Tests ====================
@@ -496,24 +527,27 @@ def test_glb_shared_texture_not_duplicated(tmp_path):
     tm_scene.export(glb_path)
 
     scene = gs.Scene(show_viewer=False)
-    entity = scene.add_entity(
-        gs.morphs.Mesh(
-            file=str(glb_path),
-            collision=False,
-            fixed=True,
-            file_meshes_are_zup=False,
-        ),
-    )
+    entities = [
+        scene.add_entity(
+            gs.morphs.Mesh(
+                file=str(glb_path),
+                pos=(0.0, 2.0 * i, 0.0),
+                collision=False,
+                fixed=True,
+                file_meshes_are_zup=False,
+            ),
+        )
+        for i in range(2)
+    ]
 
     # Submeshes are kept separate (group_by_material defaults to False to preserve baked convex decompositions), but
-    # they share one Surface whose resolved RGBA texture is memoized, so a single image array backs all of them rather
-    # than one full-resolution copy per submesh.
-    vgeoms = entity.vgeoms
-    assert len(vgeoms) == n_submeshes
-    assert len({id(geom.surface) for geom in vgeoms}) == 1
-    # Hold every array alive before counting so that ids cannot be recycled by the garbage collector.
-    rgba_arrays = [geom.surface.get_rgba().image_array for geom in vgeoms]
-    assert len({id(array) for array in rgba_arrays}) == 1
+    # they share one Surface whose resolved RGBA texture is memoized on its content, so a single image array backs all
+    # of them, and those of every other entity loaded from the file, rather than one full-resolution copy per submesh.
+    for entity in entities:
+        assert len(entity.vgeoms) == n_submeshes
+        assert len({id(geom.surface) for geom in entity.vgeoms}) == 1
+    rgba_arrays = [geom.surface.get_rgba().image_array for entity in entities for geom in entity.vgeoms]
+    assert all([array is rgba_arrays[0] for array in rgba_arrays])
 
     scene.build()
     retriever = GenesisGeomRetriever(scene.sim.rigid_solver, seg_level="entity")
@@ -523,11 +557,10 @@ def test_glb_shared_texture_not_duplicated(tmp_path):
 
 
 @pytest.mark.required
-def test_glb_uv_set_and_unlit_albedo_resolution(emissive_material_variants_glb):
+def test_glb_uv_set_and_unlit_albedo_resolution(material_variants_glb):
     # A single UV set is baked per mesh, following whichever texture actually samples it, and unlit imagery must not be
     # hidden by the white base that a missing color installs. parse_glb_material returns the chosen texCoord and surface.
-    glb = pygltflib.GLTF2().load(emissive_material_variants_glb)
-    glb.convert_images(pygltflib.ImageFormat.DATAURI)
+    glb = pygltflib.GLTF2().load(material_variants_glb)
 
     # A base-color atlas owns the UV set; an emissive on a different texCoord does not replace it.
     _, base_atlas_uvs, _ = gltf_utils.parse_glb_material(glb, 0, gs.surfaces.Default())
@@ -871,31 +904,68 @@ def test_mjcf_2d_texture_mapping(textured_mjcf):
     explicit_uvs = [np.unique(vgeoms["mesh_explicit_a"].uvs, axis=0), np.unique(vgeoms["mesh_explicit_b"].uvs, axis=0)]
     assert_allclose(explicit_uvs, EXPECTED_EXPLICIT_UVS, tol=gs.EPS)
 
+    rgba_arrays = [vgeom.vmesh.surface.get_rgba().image_array for vgeom in vgeoms.values()]
+    assert all([array is rgba_arrays[0] for array in rgba_arrays])
+    rigid_nodes = scene.visualizer.context.rigid_nodes
+    base_color_textures = [
+        rigid_nodes[vgeom.uid].mesh.primitives[0].material.baseColorTexture for vgeom in vgeoms.values()
+    ]
+    assert base_color_textures[0] is not None
+    assert all([texture is base_color_textures[0] for texture in base_color_textures])
+    with pytest.raises(ValueError, match="read-only"):
+        vgeoms["box_uniform"].vmesh.surface.diffuse_texture.image_array[0, 0] = 0
+
 
 # ==================== Surface Reconstruction Tests ====================
 
 
 @pytest.mark.required
-def test_splashsurf_surface_reconstruction(show_viewer):
-    scene = gs.Scene(show_viewer=show_viewer)
-    scene.add_entity(
-        material=gs.materials.SPH.Liquid(),
-        morph=gs.morphs.Box(
-            pos=(0.15, 0.15, 0.22),
-            size=(0.25, 0.25, 0.4),
+def test_surface_reconstruction(show_viewer):
+    # The particle size differs from the one of MPM, so that each solver must reconstruct its liquid at its own size
+    scene = gs.Scene(
+        sph_options=gs.options.SPHOptions(
+            particle_size=0.04,
         ),
-        surface=gs.surfaces.Default(
-            color=(0.2, 0.6, 1.0, 1.0),
-            vis_mode="recon",
+        pbd_options=gs.options.PBDOptions(
+            particle_size=0.04,
         ),
+        show_viewer=show_viewer,
     )
+    # The liquids of each backend are placed symmetrically with respect to the camera, so that they look the same
+    liquids = []
+    for material, recon_backend, pos_y in (
+        (gs.materials.SPH.Liquid(), "splashsurf", -0.2),
+        (gs.materials.PBD.Liquid(), "splashsurf", 0.2),
+        (gs.materials.SPH.Liquid(), "levelset", -0.6),
+        (gs.materials.PBD.Liquid(), "levelset", 0.6),
+    ):
+        liquids.append(
+            scene.add_entity(
+                material=material,
+                morph=gs.morphs.Box(
+                    pos=(0.0, pos_y, 0.2),
+                    size=(0.25, 0.25, 0.4),
+                ),
+                surface=gs.surfaces.Default(
+                    color=(0.2, 0.6, 1.0, 1.0),
+                    vis_mode="recon",
+                    recon_backend=recon_backend,
+                ),
+            )
+        )
     cam = scene.add_camera(
-        pos=(1.3, 1.3, 0.8),
+        pos=(3.5, 0.0, 0.2),
         lookat=(0.0, 0.0, 0.2),
         GUI=show_viewer,
     )
     scene.build()
-    cam.render(rgb=True, depth=False, segmentation=False, colorize_seg=False, normal=False)
+
+    # Both liquids of a backend fill the same box, so their surfaces cover the same area of the image
+    _, _, seg, _ = cam.render(rgb=False, depth=False, segmentation=True, colorize_seg=False, normal=False)
+    seg_idx = {seg_key: idx for idx, seg_key in scene.segmentation_idx_dict.items()}
+    liquids_n_pixels = np.array([(seg == seg_idx[liquid.idx]).sum() for liquid in liquids])
+    assert (liquids_n_pixels > 0).all()
+    assert_allclose(liquids_n_pixels[1::2], liquids_n_pixels[::2], rtol=0.15)
 
 
 # ==================== Mesh Processing/Caching Tests ====================

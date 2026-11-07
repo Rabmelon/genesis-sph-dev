@@ -11,7 +11,7 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-import genesis.utils.array_class as array_class
+from genesis.utils.array_class import ColliderInfo, ColliderState, DynInfo, DynState, GeomsInitAABB, RigidInfo
 from . import support_field
 
 from .contact import func_add_contact, func_compute_geom_pair_scale, rotaxis, rotmatx
@@ -22,11 +22,10 @@ def func_sphere_box_contact(
     i_ga: int,
     i_gb: int,
     ga_pos: qd.types.vector(3),
-    ga_quat: qd.types.vector(4),
     gb_pos: qd.types.vector(3),
     gb_quat: qd.types.vector(4),
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
 ):
     """
     Analytical sphere-box collision detection.
@@ -110,14 +109,14 @@ def func_plane_box_contact(
     i_gb: int,
     i_b: int,
     i_pair: int,
-    geoms_init_AABB: array_class.GeomsInitAABB,
-    dyn_state: array_class.DynState,
-    collider_state: array_class.ColliderState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
-    collider_info: array_class.ColliderInfo,
+    geoms_init_AABB: GeomsInitAABB,
+    dyn_state: DynState,
+    collider_state: ColliderState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    collider_info: ColliderInfo,
     rigid_config: qd.template(),
-    collider_static_config: qd.template(),
+    collider_config: qd.template(),
     errno: qd.Tensor,
 ):
     ga_pos, ga_quat = dyn_state.geoms.pos[i_ga, i_b], dyn_state.geoms.quat[i_ga, i_b]
@@ -160,7 +159,7 @@ def func_plane_box_contact(
             for i_v in range(dyn_info.geoms.vert_start[i_gb], dyn_info.geoms.vert_end[i_gb]):
                 # Plane-box pairs are sized with the convex cap (they are not in the large-contact mask), so the
                 # emission must stay within it to avoid overflowing a buffer allocated as a convex pair.
-                if n_con < qd.static(collider_static_config.n_contacts_per_convex_pair):
+                if n_con < qd.static(collider_config.n_contacts_per_convex_pair):
                     pos_corner = gu.qd_transform_by_trans_quat_fast(dyn_info.verts.init_pos[i_v], gb_pos, gb_quat)
                     penetration = normal.dot(pos_corner - ga_pos)
                     if penetration > 0.0:
@@ -191,12 +190,12 @@ def func_box_box_contact(
     i_gb: int,
     i_b: int,
     i_pair: int,
-    dyn_state: array_class.DynState,
-    collider_state: array_class.ColliderState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
-    collider_info: array_class.ColliderInfo,
-    collider_static_config: qd.template(),
+    dyn_state: DynState,
+    collider_state: ColliderState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    collider_info: ColliderInfo,
+    collider_config: qd.template(),
     errno: qd.Tensor,
 ):
     """
@@ -217,7 +216,6 @@ def func_box_box_contact(
     cle1, cle2 = 0, 0
     in_ = 0
     tmp2 = qd.Vector.zero(gs.qd_float, 3)
-    margin2 = margin * margin
     rotmore = qd.Matrix.zero(gs.qd_float, 3, 3)
 
     ga_pos = dyn_state.geoms.pos[i_ga, i_b]
@@ -289,21 +287,12 @@ def func_box_box_contact(
         if c1 >= EPS:
             c2 = pos21.dot(tmp2)
 
+            # The overlap is computed by projecting both boxes on the normalized axis. Deriving it from the rotation
+            # instead divides its rounding errors by the norm of a nearly vanishing cross product, which lets a
+            # nearly parallel edge pair report less overlap than a face normal and win the separating axis test.
             c3 = gs.qd_float(0.0)
-
             for k in qd.static(range(3)):
-                if k != i:
-                    c3 = c3 + size1[k] * qd.abs(tmp2[k])
-
-            for k in qd.static(range(3)):
-                if k != j:
-                    m = i
-                    n = 3 - k - j
-                    if k - j > 3:
-                        m = m - 1
-                        n = n + 3
-                    c3 = c3 + size2[k] * rotabs[m, n] / c1
-
+                c3 = c3 + size1[k] * qd.abs(tmp2[k]) + size2[k] * qd.abs(tmp2.dot(rot[:, k]))
             c3 = c3 - qd.abs(c2)
 
             if c3 < -margin:
@@ -497,9 +486,11 @@ def func_box_box_contact(
                         )
                         n = n + 1
 
+            # The deepest corner of the incident box is the sole candidate of a vertex lying on the face. Otherwise a
+            # corner is a patch vertex only inside the reference face, as exactly aligned faces tie all their corners.
             for i in range(1 << (m - 1)):
                 tmp1 = collider_state.box_pts[0 if i == 0 else i + 2, i_b]
-                if not (i and (tmp1[0] <= -lx or tmp1[0] >= lx or tmp1[1] <= -ly or tmp1[1] >= ly)):
+                if m == 1 or not (tmp1[0] <= -lx or tmp1[0] >= lx or tmp1[1] <= -ly or tmp1[1] >= ly):
                     collider_state.box_points[n, i_b] = tmp1
                     n = n + 1
             m = n
@@ -521,8 +512,8 @@ def func_box_box_contact(
             n_added = 0
             n_start = collider_state.n_contacts[i_b]
             for i in range(n):
-                if n_added < qd.static(collider_static_config.n_contacts_per_nonconvex_pair):
-                    dist = collider_state.box_points[i, i_b][2]
+                if n_added < qd.static(collider_config.n_contacts_per_nonconvex_pair):
+                    dist = collider_state.box_depth[i, i_b]
                     collider_state.box_points[i, i_b][2] = collider_state.box_points[i, i_b][2] + hz
                     contact_pos = p + r @ collider_state.box_points[i, i_b]
 
@@ -755,7 +746,9 @@ def func_box_box_contact(
                                         )
                                         n = n + 1
 
-                nl = n
+                # The corners of the reference face inside the projected incident face, then the corners of the incident
+                # face projected inside the reference face, complete the patch. Either lies on its own face, with its
+                # depth along the contact normal.
                 a = collider_state.box_pts[1, i_b][0]
                 b = collider_state.box_pts[2, i_b][0]
                 c = collider_state.box_pts[1, i_b][1]
@@ -772,77 +765,26 @@ def func_box_box_contact(
                     u = (x * d - y * b) / c1
                     v = (y * a - x * c) / c1
 
-                    if nl == 0:
-                        if (u < 0 or u > 1) and (v < 0 or v > 1):
-                            continue
-                    elif u < 0 or u > 1 or v < 0 or v > 1:
-                        continue
-
-                    u = qd.math.clamp(u, 0, 1)
-                    v = qd.math.clamp(v, 0, 1)
-                    tmp1 = (
-                        collider_state.box_pu[0, i_b] * (1 - u - v)
-                        + collider_state.box_pu[1, i_b] * u
-                        + collider_state.box_pu[2, i_b] * v
-                    )
-                    collider_state.box_points[n, i_b][0] = llx
-                    collider_state.box_points[n, i_b][1] = lly
-                    collider_state.box_points[n, i_b][2] = 0
-
-                    tmp2 = collider_state.box_points[n, i_b] - tmp1
-
-                    c2 = tmp2.dot(tmp2)
-
-                    if not (tmp1[2] > 0 and c2 > margin2):
-                        collider_state.box_points[n, i_b] = collider_state.box_points[n, i_b] + tmp1
-                        collider_state.box_points[n, i_b] = collider_state.box_points[n, i_b] * 0.5
-
-                        collider_state.box_depth[n, i_b] = qd.sqrt(c2) * (-1 if tmp1[2] < 0 else 1)
-                        n = n + 1
-
-                nf = n
+                    if 0 <= u and u <= 1 and 0 <= v and v <= 1:
+                        tmp1 = (
+                            collider_state.box_pu[0, i_b] * (1 - u - v)
+                            + collider_state.box_pu[1, i_b] * u
+                            + collider_state.box_pu[2, i_b] * v
+                        )
+                        if tmp1[2] <= margin:
+                            tmp2 = qd.Vector([llx, lly, 0.0], dt=gs.qd_float)
+                            collider_state.box_points[n, i_b] = 0.5 * (tmp2 + tmp1)
+                            collider_state.box_depth[n, i_b] = -(tmp2 - tmp1).norm()
+                            n = n + 1
 
                 for i in range(4):
                     x, y = collider_state.box_ppts2[i, 0, i_b], collider_state.box_ppts2[i, 1, i_b]
-
-                    if nl == 0:
-                        if (nf != 0) and (x < -lx or x > lx) and (y < -ly or y > ly):
-                            continue
-                    elif x < -lx or x > lx or y < -ly or y > ly:
-                        continue
-
-                    c1 = 0
-                    for j in qd.static(range(2)):
-                        if collider_state.box_ppts2[i, j, i_b] < -s[j]:
-                            c1 = c1 + (collider_state.box_ppts2[i, j, i_b] + s[j]) ** 2
-                        elif collider_state.box_ppts2[i, j, i_b] > s[j]:
-                            c1 = c1 + (collider_state.box_ppts2[i, j, i_b] - s[j]) ** 2
-
-                    c1 = c1 + (collider_state.box_pu[i, i_b][2] * innorm) ** 2
-
-                    if collider_state.box_pu[i, i_b][2] > 0 and c1 > margin2:
-                        continue
-
-                    tmp1 = qd.Vector(
-                        [
-                            collider_state.box_ppts2[i, 0, i_b] * 0.5,
-                            collider_state.box_ppts2[i, 1, i_b] * 0.5,
-                            0,
-                        ],
-                        dt=gs.qd_float,
-                    )
-
-                    for j in qd.static(range(2)):
-                        if collider_state.box_ppts2[i, j, i_b] < -s[j]:
-                            tmp1[j] = -s[j] * 0.5
-                        elif collider_state.box_ppts2[i, j, i_b] > s[j]:
-                            tmp1[j] = s[j] * 0.5
-
-                    tmp1 = tmp1 + collider_state.box_pu[i, i_b] * 0.5
-                    collider_state.box_points[n, i_b] = tmp1
-
-                    collider_state.box_depth[n, i_b] = qd.sqrt(c1) * (-1 if collider_state.box_pu[i, i_b][2] < 0 else 1)
-                    n = n + 1
+                    if -lx <= x and x <= lx and -ly <= y and y <= ly:
+                        if collider_state.box_pu[i, i_b][2] <= margin:
+                            tmp1 = qd.Vector([x, y, 0.0], dt=gs.qd_float)
+                            collider_state.box_points[n, i_b] = 0.5 * (tmp1 + collider_state.box_pu[i, i_b])
+                            collider_state.box_depth[n, i_b] = collider_state.box_pu[i, i_b][2] / qd.abs(rnorm[2])
+                            n = n + 1
 
                 r = mat1 @ rotmore.transpose()
 
@@ -851,7 +793,7 @@ def func_box_box_contact(
                 n_added = 0
                 n_start = collider_state.n_contacts[i_b]
                 for i in range(n):
-                    if n_added < qd.static(collider_static_config.n_contacts_per_nonconvex_pair):
+                    if n_added < qd.static(collider_config.n_contacts_per_nonconvex_pair):
                         dist = collider_state.box_depth[i, i_b]
                         collider_state.box_points[i, i_b][2] = collider_state.box_points[i, i_b][2] + hz
                         contact_pos = pos1 + (r @ collider_state.box_points[i, i_b])

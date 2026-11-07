@@ -1,10 +1,12 @@
-import sys
+import torch
 
-import numpy as np
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
+from genesis.utils.array_class import ConstraintState, DynState, RigidInfo
+from genesis.utils.data import eoa
+from genesis.utils.misc import qd_to_torch
+
 from . import linesearch
 from . import solver
 
@@ -20,7 +22,7 @@ LS_ALPHA_MAX = 1e4
 
 @qd.func
 def _func_update_constraint_forces_body(
-    i_c: int, i_b: int, constraint_state: array_class.ConstraintState, rigid_config: qd.template()
+    i_c: int, i_b: int, constraint_state: ConstraintState, rigid_config: qd.template()
 ):
     """Per-element body for ``_func_update_constraint_forces``. Factored out so the two
     ndrange orderings (coalescing-optimal for each layout) share a single implementation."""
@@ -61,13 +63,23 @@ def _func_update_constraint_forces_body(
 
 
 @qd.func
-def _func_update_constraint_forces(constraint_state: array_class.ConstraintState, rigid_config: qd.template()):
+def _func_update_constraint_forces_row(
+    i_c: int, i_b: int, constraint_state: ConstraintState, rigid_config: qd.template()
+):
+    """Update the active flag and the force of one row of an iterating env, a row standing still keeping both."""
+    if solver.func_is_row_moving(i_c, i_b, constraint_state, skip_settled_islands=True):
+        _func_update_constraint_forces_body(i_c, i_b, constraint_state, rigid_config)
+    elif qd.static(
+        rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.enable_elliptic_friction
+    ):
+        constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+
+
+@qd.func
+def _func_update_constraint_forces(constraint_state: ConstraintState, rigid_config: qd.template()):
     """Compute active flags and efc_force, parallelized over (constraint, env).
 
-    Iteration order is picked at compile time so adjacent lanes always cover the *physical* contiguous dimension of the
-    layout-flippable constraint-state tensors:
-      - layout False (canonical [i_c, i_b], physical [i_c, i_b]):  ndrange(len_constraints, _B)
-      - layout True  (canonical [i_c, i_b], physical [i_b, i_c]):  ndrange(_B, len_constraints)
+    The cooperative kernels update the rows in the line search instead, see _func_update_constraint_forces_batch.
     """
     len_constraints = constraint_state.active.shape[0]
     _B = constraint_state.grad.shape[1]
@@ -77,30 +89,50 @@ def _func_update_constraint_forces(constraint_state: array_class.ConstraintState
     # prev_active. Pyramidal threads only write their own row, so they snapshot inline in the body (no extra pass).
     if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton and rigid_config.enable_elliptic_friction):
         qd.loop_config(name="snapshot_prev_active", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-        for i_c, i_b in qd.ndrange(
-            len_constraints, _B, axes=qd.static((1, 0) if rigid_config.enable_cooperative_constraint_kernels else None)
-        ):
+        for i_c, i_b in qd.ndrange(len_constraints, _B, axes=qd.static(eoa(constraint_state.prev_active))):
             if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
                 constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
 
     # A row of an island standing still keeps its values and shows no flip to the incremental factor, see
     # func_update_constraint_batch.
     qd.loop_config(name="update_constraint_forces", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_c, i_b in qd.ndrange(
-        len_constraints, _B, axes=qd.static((1, 0) if rigid_config.enable_cooperative_constraint_kernels else None)
-    ):
+    for i_c, i_b in qd.ndrange(len_constraints, _B, axes=qd.static(eoa(constraint_state.active))):
         if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
-            if solver.func_is_row_moving(i_c, i_b, constraint_state, skip_settled_islands=True):
-                _func_update_constraint_forces_body(i_c, i_b, constraint_state, rigid_config)
-            elif qd.static(
-                rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.enable_elliptic_friction
-            ):
-                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+            _func_update_constraint_forces_row(i_c, i_b, constraint_state, rigid_config)
 
 
 @qd.func
-def _func_update_qfrc_constraint_per_dof(constraint_state: array_class.ConstraintState, rigid_config: qd.template()):
+def _func_update_constraint_forces_batch(
+    i_b: int, tid: int, constraint_state: ConstraintState, rigid_config: qd.template()
+):
+    """Compute the active flags and efc_force of the rows of one env that moved, by the _K lanes of its block.
+
+    The lanes stride over the rows of the env, which fills a small share of the constraint capacity. The block waits
+    for the step applied to every row first, and under the elliptic cone the previous active flags are all captured
+    before any is recomputed, see _func_update_constraint_forces.
+    """
+    _K = qd.static(32)
+    n_con = constraint_state.n_constraints[i_b]
+    qd.simt.block.sync()
+    if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton and rigid_config.enable_elliptic_friction):
+        for i_chunk_ in range((n_con + _K - 1) // _K):
+            i_c = i_chunk_ * _K + tid
+            if i_c < n_con:
+                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+        qd.simt.block.sync()
+    for i_chunk_ in range((n_con + _K - 1) // _K):
+        i_c = i_chunk_ * _K + tid
+        if i_c < n_con:
+            _func_update_constraint_forces_row(i_c, i_b, constraint_state, rigid_config)
+
+
+@qd.func
+def _func_update_qfrc_constraint_per_dof(
+    dyn_state: DynState, constraint_state: ConstraintState, rigid_config: qd.template(), update_gradient: qd.template()
+):
     """Compute qfrc_constraint = J^T @ efc_force with one thread per (dof, env).
+
+    Under update_gradient the thread also forms the gradient of its dof from it, see func_update_gradient_no_solve.
 
     A DOF only couples to constraints in its own island (a constraint touching the DOF is always in its island), so
     the sum runs over that island's constraints (constraint_id) rather than all n_con - identical result, but O(nnz)
@@ -110,11 +142,11 @@ def _func_update_qfrc_constraint_per_dof(constraint_state: array_class.Constrain
     qfrc_constraint write coalesces under the flipped DOF-vec layout.
     """
     n_dofs = constraint_state.qfrc_constraint.shape[0]
-    _B = constraint_state.grad.shape[1]
 
     qd.loop_config(name="update_constraint_qfrc", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_d, i_b in qd.ndrange(
-        n_dofs, _B, axes=qd.static((1, 0) if rigid_config.enable_cooperative_constraint_kernels else None)
+        *constraint_state.qfrc_constraint.shape,
+        axes=qd.static((1, 0) if rigid_config.enable_cooperative_constraint_kernels else None),
     ):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             # A dof of an island standing still keeps its value, see func_update_constraint_batch. A single-island
@@ -135,30 +167,36 @@ def _func_update_qfrc_constraint_per_dof(constraint_state: array_class.Constrain
                         i_c = constraint_state.island.constraint_id[con_base + i_lcon, i_b]
                     qfrc += constraint_state.jac[i_c, i_d, i_b] * constraint_state.efc_force[i_c, i_b]
                 constraint_state.qfrc_constraint[i_d, i_b] = qfrc
+                if qd.static(update_gradient):
+                    constraint_state.grad[i_d, i_b] = (
+                        constraint_state.Ma[i_d, i_b] - dyn_state.dofs.qf_smooth[i_d, i_b] - qfrc
+                    )
 
 
 @qd.func
 def _func_update_gradient(
-    dyn_state: array_class.DynState,
-    constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
-    rigid_config: qd.template(),
+    dyn_state: DynState, constraint_state: ConstraintState, rigid_info: RigidInfo, rigid_config: qd.template()
 ):
-    """Step 5: Update gradient"""
+    """Step 5: update the gradient of every env still iterating, one env per thread.
+
+    Where the solve is seeded one env per thread (see has_per_env_solve_seed in array_class.py), the Hessian of the env
+    is assembled and factored first.
+    """
     _B = constraint_state.grad.shape[1]
     qd.loop_config(name="update_gradient", serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
     for i_b in range(_B):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-            solver.func_update_gradient_batch(i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
+            if qd.static(rigid_config.has_per_env_solve_seed):
+                solver.func_hessian_and_cholesky_factor_direct_batch(i_b, constraint_state, rigid_info, rigid_config)
+            solver.func_update_gradient_batch(i_b, dyn_state, constraint_state, rigid_info, rigid_config)
 
 
 @qd.func
 def _func_islands_linesearch_and_apply(
-    dyn_state: array_class.DynState,
-    constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    graph_counter: qd.types.ndarray(qd.i32, ndim=0),
+    dyn_state: DynState,
+    constraint_state: ConstraintState,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
     """Steps 1 to 4: the lockstep line search of every island of an env and the step applied, by the lanes of the env's
@@ -167,6 +205,12 @@ def _func_islands_linesearch_and_apply(
     A single-island scene runs the search of its one island by the lanes with the state in registers
     (func_search_single_island). Without the cooperative kernels (a GPU where they are disabled, the arm pinned
     regardless) lane 0 runs the serial sweeps.
+
+    Under the cooperative kernels the lanes of an env that moved then update the active flag and the force of its rows
+    (_func_update_constraint_forces_batch), while its rows are still in cache.
+
+    The first lane opens the iteration of the graph loop: it counts the iteration and ends the loop, which the search
+    direction of any env that iterates on resumes (see _func_islands_update_search_direction).
     """
     _K = qd.static(32)
     _B = constraint_state.grad.shape[1]
@@ -174,14 +218,20 @@ def _func_islands_linesearch_and_apply(
     for i_flat in range(_B * _K):
         tid = i_flat % _K
         i_b = i_flat // _K
+        if i_flat == 0:
+            constraint_state.solver_iter_counter[()] = constraint_state.solver_iter_counter[()] + 1
+            constraint_state.graph_counter_next[()] = graph_counter[()] - 1
+            graph_counter[()] = 0
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             if qd.static(rigid_config.enable_cooperative_constraint_kernels and rigid_config.is_single_island):
                 linesearch.func_mv_jv_coop(i_b, tid, constraint_state, rigid_info)
                 is_moved = linesearch.func_search_single_island(
-                    i_b, tid, _K, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_coop=True
+                    i_b, tid, _K, dyn_state, constraint_state, rigid_info, rigid_config, is_coop=True
                 )
                 if tid == 0:
                     constraint_state.improved[i_b] = is_moved
+                if is_moved:
+                    _func_update_constraint_forces_batch(i_b, tid, constraint_state, rigid_config)
             elif qd.static(rigid_config.enable_cooperative_constraint_kernels):
                 sh_acc = qd.simt.block.SharedArray((10 * _K,), gs.qd_float)
                 # The regime changes of the 'signorini' cost alone, a single slot otherwise (see func_cone_head_kinks in
@@ -204,28 +254,32 @@ def _func_islands_linesearch_and_apply(
                     sh_alpha,
                     dyn_state,
                     constraint_state,
-                    dyn_info,
                     rigid_info,
                     rigid_config,
                 )
                 if tid == 0:
                     constraint_state.improved[i_b] = is_moved
+                if is_moved:
+                    _func_update_constraint_forces_batch(i_b, tid, constraint_state, rigid_config)
             else:
                 if tid == 0:
                     constraint_state.improved[i_b] = linesearch.func_linesearch_islands_serial(
-                        i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config
+                        i_b, dyn_state, constraint_state, rigid_info, rigid_config
                     )
 
 
 @qd.func
 def _func_islands_update_search_direction(
-    dyn_state: array_class.DynState,
-    constraint_state: array_class.ConstraintState,
-    rigid_info: array_class.RigidInfo,
+    graph_counter: qd.types.ndarray(qd.i32, ndim=0),
+    constraint_state: ConstraintState,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
-    """Step 6: every island's exit test and next direction, see
-    _func_islands_linesearch_and_apply for the lane arrangement."""
+    """Step 6: every island's exit test and next direction, see _func_islands_linesearch_and_apply for the lane
+    arrangement.
+
+    An env that iterates on resumes the graph loop with the iterations left, every such env writing the same count.
+    """
     _K = qd.static(32)
     _B = constraint_state.grad.shape[1]
     qd.loop_config(name="islands_update_search_direction", block_dim=_K)
@@ -239,6 +293,8 @@ def _func_islands_update_search_direction(
                 )
                 if tid == 0:
                     constraint_state.improved[i_b] = improved
+                    if improved:
+                        graph_counter[()] = constraint_state.graph_counter_next[()]
             elif qd.static(rigid_config.enable_cooperative_constraint_kernels):
                 sh_acc = qd.simt.block.SharedArray((7 * _K,), gs.qd_float)
                 sh_pending = qd.simt.block.SharedArray((_K,), gs.qd_int)
@@ -248,35 +304,16 @@ def _func_islands_update_search_direction(
                 )
                 if tid == 0:
                     constraint_state.improved[i_b] = improved
+                    if improved:
+                        graph_counter[()] = constraint_state.graph_counter_next[()]
             else:
                 if tid == 0:
-                    constraint_state.improved[i_b] = linesearch.func_exit_islands_serial(
+                    improved = linesearch.func_exit_islands_serial(
                         i_b, constraint_state, rigid_info, rigid_config, certify=False
                     )
-
-
-@qd.func
-def _func_check_early_exit(
-    graph_counter: qd.types.ndarray(qd.i32, ndim=0), constraint_state: array_class.ConstraintState
-):
-    """Decrement iteration counter and exit early if no batch element improved. solver_iter_counter counts the
-    iterations the graph ran, whichever path it took."""
-    qd.loop_config(name="check_early_exit_reset_flag")
-    for _ in range(1):
-        graph_counter[()] = graph_counter[()] - 1
-        constraint_state.solver_iter_counter[()] = constraint_state.solver_iter_counter[()] + 1
-        constraint_state.early_exit_flag[()] = 0
-
-    _B = constraint_state.grad.shape[1]
-    qd.loop_config(name="check_early_exit_scan_values")
-    for i_b in range(_B):
-        if constraint_state.improved[i_b]:
-            qd.atomic_max(constraint_state.early_exit_flag[()], 1)
-
-    qd.loop_config(name="check_early_exit_set_counter")
-    for _ in range(1):
-        if constraint_state.early_exit_flag[()] == 0:
-            graph_counter[()] = 0
+                    constraint_state.improved[i_b] = improved
+                    if improved:
+                        graph_counter[()] = constraint_state.graph_counter_next[()]
 
 
 # ============================================== Solve body dispatch ================================================
@@ -285,32 +322,32 @@ def _func_check_early_exit(
 @qd.kernel(graph=True, fastcache=True)
 def _kernel_solve_graph(
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
-    dyn_state: array_class.DynState,
-    constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    constraint_state: ConstraintState,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
     while qd.graph.do_while(graph_counter):
         # Every island's line search in lockstep, the step applied and the CG gradients saved per island
-        _func_islands_linesearch_and_apply(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
-        _func_update_constraint_forces(constraint_state, rigid_config)
-        _func_update_qfrc_constraint_per_dof(constraint_state, rigid_config)
-        if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton):
+        _func_islands_linesearch_and_apply(graph_counter, dyn_state, constraint_state, rigid_info, rigid_config)
+        if qd.static(not rigid_config.enable_cooperative_constraint_kernels):
+            _func_update_constraint_forces(constraint_state, rigid_config)
+        # The tiled Newton factor below reads the gradient alone, so the thread of a dof forms it with its force
+        is_tiled_newton = qd.static(
+            rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.has_per_env_solve_seed
+        )
+        _func_update_qfrc_constraint_per_dof(dyn_state, constraint_state, rigid_config, update_gradient=is_tiled_newton)
+        if qd.static(is_tiled_newton):
             # Every island's Hessian block maintained in nt_H, patched with the rows whose active state flipped, then a
             # tiled factor + solve of every island in its own shared tile, which reads the block without consuming it,
             # the coupled elliptic-cone block bracketed around the factor (see func_wrap_cone_hessian).
             solver.func_island_hessian_assemble_all(constraint_state, rigid_info, rigid_config, patch=True)
-            solver.func_update_gradient_no_solve(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
             solver.func_wrap_cone_hessian(constraint_state, rigid_config, is_removal=False, is_enabled=True)
-            solver.func_island_tiled_factor_solve_all(
-                constraint_state, dyn_info, rigid_info, rigid_config, write_L=False
-            )
+            solver.func_island_tiled_factor_solve_all(constraint_state, rigid_info, rigid_config, write_L=False)
             solver.func_wrap_cone_hessian(constraint_state, rigid_config, is_removal=True, is_enabled=True)
         else:
-            _func_update_gradient(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
-        _func_islands_update_search_direction(dyn_state, constraint_state, rigid_info, rigid_config)
-        _func_check_early_exit(graph_counter, constraint_state)
+            _func_update_gradient(dyn_state, constraint_state, rigid_info, rigid_config)
+        _func_islands_update_search_direction(graph_counter, constraint_state, rigid_info, rigid_config)
 
 
 @solver.func_solve_body.register(
@@ -330,11 +367,18 @@ def func_solve_decomposed(dyn_state, constraint_state, dyn_info, rigid_info, rig
     Early exits when all batch elements have converged (no improved[i_b] is True).
 
     The per-iteration factor/solve runs per island over the (env, island) work-list, an unpartitioned env being a
-    single island spanning every dof.
+    single island spanning every dof, except where the solve is seeded one env per thread (see has_per_env_solve_seed
+    in array_class.py): the seed and every factor then run one env per thread.
     """
     # The graph maintains the assembled Hessian in nt_H, so the seed leaves it there (write_L=False).
-    solver.func_solve_init(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, write_L=False)
+    solver.func_solve_init(dyn_state, constraint_state, rigid_info, rigid_config, write_L=False)
     if _n_iterations <= 0:
         return
-    constraint_state.graph_counter.from_numpy(np.array(_n_iterations, dtype=np.int32))
-    _kernel_solve_graph(constraint_state.graph_counter, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
+    if gs.use_zerocopy:
+        graph_counter = qd_to_torch(constraint_state.graph_counter, copy=False)
+        graph_counter.fill_(_n_iterations)
+        if gs.backend == gs.metal:
+            torch.mps.synchronize()
+    else:
+        constraint_state.graph_counter.fill(_n_iterations)
+    _kernel_solve_graph(constraint_state.graph_counter, dyn_state, constraint_state, rigid_info, rigid_config)

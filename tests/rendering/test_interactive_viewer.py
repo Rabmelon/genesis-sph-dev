@@ -1,20 +1,26 @@
+import functools
 import re
 import sys
 import threading
 import time
 
 import numpy as np
-import OpenGL.error
 import pytest
 
+import av
+import OpenGL.error
+from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
+
 import genesis as gs
+import genesis.utils.geom as gu
 from genesis.options.sensors import RasterizerCameraOptions
+from genesis.recorders.trajectory import TRAJECTORY_FORMAT, Trajectory
 from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind, KeyMod, MouseButton
 from genesis.vis.viewer_plugins.plugins.mouse_interaction import GRAB_ACC
 
 from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_IMGUI_BUNDLE, SKIP_NO_VIEWER, is_imgui_bundle_supported
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal, rgb_array_to_png_bytes
 from .conftest import RENDERER_TYPE
 
 CAM_RES = (480, 320)
@@ -63,8 +69,13 @@ def test_disable_defaults():
 @pytest.mark.required
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason=SKIP_NO_VIEWER)
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_default_plugin(n_envs):
+def test_default_plugin(n_envs, tmp_path):
+    DT = 0.01
+
     scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+        ),
         viewer_options=gs.options.ViewerOptions(
             res=CAM_RES,
             run_in_thread=(sys.platform == "linux"),
@@ -80,14 +91,31 @@ def test_default_plugin(n_envs):
         show_viewer=True,
     )
 
+    # The ground stays within the view of the camera, which the software renderer requires to render identical frames
+    # of identical states
     scene.add_entity(
-        morph=gs.morphs.Plane(),
+        morph=gs.morphs.Plane(
+            plane_size=(1.0, 1.0),
+        ),
     )
-    scene.add_entity(
+    box = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.0, 0.2),
             size=(0.2, 0.2, 0.2),
             euler=(30, 40, 0),
+        )
+    )
+    cam = scene.add_camera(
+        res=CAM_RES,
+        pos=(2.0, 0.0, 1.0),
+        lookat=(0.0, 0.0, 0.0),
+        fov=30,
+    )
+    trajectory_path = tmp_path / f"run{TRAJECTORY_FORMAT}"
+    scene.start_recording(
+        gs.recorders.TrajectoryFile(
+            filename=str(trajectory_path),
+            hz=50.0,
         )
     )
     scene.build(n_envs=n_envs)
@@ -191,6 +219,74 @@ def test_default_plugin(n_envs):
     assert pyrender_viewer._keybindings.get_by_name("key3_press") is None
     assert pyrender_viewer._keybindings.get_by_name("key3_release") is None
 
+    # Only the steps are paced to real time, so that a loop of setters runs at full speed, and a trajectory replays at
+    # one step of wall time per simulated step, the steps between its frames included. A slow machine only makes a loop
+    # longer, so a paced loop is checked against a lower bound, while a loop that must not be paced is checked against
+    # a period that no slowdown comes close to.
+    rgb_start, *_ = cam.render()
+    for _ in range(5):
+        scene.step()
+    scene.stop_recording()
+    trajectory = Trajectory(trajectory_path, scene=scene)
+    n_steps_replayed = round((trajectory.time(-1) - trajectory.time(0)).max() / DT)
+
+    period = 600.0
+    scene.viewer.realtime_factor = DT / period
+    time_start = time.perf_counter()
+    for _ in range(5):
+        box.set_pos((0.0, 0.0, 0.2))
+    assert time.perf_counter() - time_start < period
+    # A step hidden from the viewer is not paced, while the update showing it by hand is
+    time_start = time.perf_counter()
+    for _ in range(2):
+        scene.step(update_visualizer=False)
+    assert time.perf_counter() - time_start < period
+
+    period = 0.2
+    scene.viewer.realtime_factor = DT / period
+    time_start = time.perf_counter()
+    trajectory.play()
+    assert time.perf_counter() - time_start > (n_steps_replayed - 0.5) * period
+    time_start = time.perf_counter()
+    for _ in range(2):
+        scene.step()
+    assert time.perf_counter() - time_start > period
+    time_start = time.perf_counter()
+    for _ in range(2):
+        scene.step(update_visualizer=False)
+        scene.visualizer.update(force=False)
+    assert time.perf_counter() - time_start > period
+
+    # A window driven by the stepping loop keeps handling the user input while a step waits for its pace: a key pressed
+    # right before the step starts waiting is handled before the step returns. The pace is set at that same moment,
+    # which starts its period afresh, so that the step waits a whole period whatever its own work took, and a period
+    # longer than the refresh of the viewer holds one refresh at least.
+    class KeyPressOnStep(gs.vis.viewer_plugins.ViewerPlugin):
+        def update_on_sim_step(self):
+            self.viewer.dispatch_event("on_key_press", Key._4, 0)
+            self.scene.viewer.realtime_factor = DT / 0.5
+
+    scene.viewer.register_keybinds(
+        Keybind(
+            name="toggle_flag_2",
+            key=Key._4,
+            key_action=KeyAction.PRESS,
+            callback=lambda: toggle_flag(2),
+        ),
+    )
+    key_presser = scene.viewer.add_plugin(KeyPressOnStep())
+    scene.step()
+    scene.viewer.remove_plugin(key_presser)
+    if not pyrender_viewer.run_in_thread:
+        assert flags[2]
+
+    # The cameras draw a restored frame at once
+    rgb_moved, *_ = cam.render()
+    trajectory.seek(0)
+    rgb_seek, *_ = cam.render()
+    assert (rgb_moved != rgb_start).any()
+    assert_equal(rgb_seek, rgb_start)
+
 
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
@@ -198,22 +294,37 @@ def test_default_plugin(n_envs):
 @pytest.mark.skipif(not is_imgui_bundle_supported, reason=SKIP_NO_IMGUI_BUNDLE)
 def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot):
     IMAGE_FILENAME = tmp_path / "screenshot.png"
+    VIDEO_FILENAME = tmp_path / "video.mp4"
 
     # Mock 'get_save_filename' to avoid poping up an interactive dialog
     def get_save_filename(self, file_exts):
-        return IMAGE_FILENAME
+        return VIDEO_FILENAME if file_exts == ["mp4"] else IMAGE_FILENAME
 
     monkeypatch.setattr("genesis.ext.pyrender.viewer.Viewer._get_save_filename", get_save_filename)
 
+    # Record losslessly, so that the decoded video holds the very frames the viewer handed over, whatever the encoder.
+    # The encoding of a frame blocks until released, which must not hold up the simulation.
+    is_encoding, is_encoder_released = threading.Event(), threading.Event()
+
+    class BlockingVideoWriter(FFMPEG_VideoWriter):
+        def write_frame(self, img_array):
+            is_encoding.set()
+            is_encoder_released.wait()
+            super().write_frame(img_array)
+
+    monkeypatch.setattr(
+        "moviepy.video.io.ffmpeg_writer.FFMPEG_VideoWriter",
+        functools.partial(BlockingVideoWriter, codec="libx264rgb", ffmpeg_params=["-qp", "0"], pixel_format="rgb24"),
+    )
+
     # Mock 'on_key_release' to determine whether requests have been processed
-    is_done = False
+    n_key_releases = 0
     on_key_release_orig = gs.ext.pyrender.viewer.Viewer.on_key_release
 
     def on_key_release(self, symbol: int, modifiers: int):
-        nonlocal is_done
-        assert not is_done
+        nonlocal n_key_releases
         ret = on_key_release_orig(self, symbol, modifiers)
-        is_done = True
+        n_key_releases += 1
         return ret
 
     monkeypatch.setattr("genesis.ext.pyrender.viewer.Viewer.on_key_release", on_key_release)
@@ -238,31 +349,49 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
         show_viewer=True,
         show_FPS=False,
     )
-    scene.add_entity(
+    box = scene.add_entity(
         gs.morphs.Box(
             size=(0.5, 0.5, 0.5),
             pos=(0.0, 0.0, 0.0),
+            # The viewer records whatever it last drew, which may lag a step behind the scene in contrast to cameras and
+            # camera sensors, so the box must not move by itself for the recorded frames to be deterministic
+            fixed=True,
         ),
     )
     scene.build()
     pyrender_viewer = scene.visualizer.viewer._pyrender_viewer
     assert pyrender_viewer.is_active
 
+    # A viewer drawing from the main thread encodes there as well
+    if not pyrender_viewer.run_in_thread:
+        is_encoder_released.set()
+
     # Try saving the current frame
     pyrender_viewer.dispatch_event("on_key_release", Key.S, 0)
+    wait_for_viewer_events(pyrender_viewer, lambda: n_key_releases == 1)
 
-    # Waiting for request completion
-    if pyrender_viewer.run_in_thread:
-        for i in range(100):
-            if is_done:
-                is_done = False
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("Keyboard event not processed before timeout")
-    else:
-        pyrender_viewer.dispatch_pending_events()
-        pyrender_viewer.dispatch_events()
+    # Record a video of the pose the recording starts at and of another one, a frame each however many times the viewer
+    # draws them. The viewer records a frame once the simulation advances, so a step follows the pose setter. Only the
+    # watchdog releases the encoder if the simulation waits for it, or if the test fails before releasing it.
+    watchdog = threading.Timer(30.0, is_encoder_released.set)
+    watchdog.start()
+    pyrender_viewer.dispatch_event("on_key_release", Key.R, 0)
+    wait_for_viewer_events(pyrender_viewer, lambda: n_key_releases == 2)
+    scene.visualizer.update(force=True)
+    wait_for_viewer_events(pyrender_viewer, lambda: pyrender_viewer._last_recorded_t == scene.sim.cur_step_global)
+    wait_for_viewer_events(pyrender_viewer, is_encoding.is_set)
+    box.set_pos((0.0, 0.4, 0.0))
+    scene.step()
+    scene.visualizer.update(force=True)
+    watchdog.cancel()
+    assert not pyrender_viewer.run_in_thread or not is_encoder_released.is_set()
+    is_encoder_released.set()
+    wait_for_viewer_events(pyrender_viewer, lambda: pyrender_viewer._last_recorded_t == scene.sim.cur_step_global)
+    pyrender_viewer.dispatch_event("on_key_release", Key.R, 0)
+    wait_for_viewer_events(pyrender_viewer, lambda: n_key_releases == 3)
+    with av.open(VIDEO_FILENAME) as container:
+        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(frames) == 2
 
     # Skip the rest of the test if necessary.
     # Similarly, 'glBlitFramebuffer(..., GL_DEPTH_BUFFER_BIT, GL_NEAREST)' involved in offscreen rendering of depth map
@@ -278,21 +407,25 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
     # Make sure that the result is valid
     with open(IMAGE_FILENAME, "rb") as f:
         assert f.read() == png_snapshot
+    for frame in frames:
+        assert rgb_array_to_png_bytes(frame) == png_snapshot
 
 
 @pytest.mark.required
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason=SKIP_NO_VIEWER)
 @pytest.mark.parametrize(
-    "n_envs, env_spacing, n_envs_per_row, target_env_idx, target_offset, use_visual_geom",
+    "n_envs, env_spacing, n_envs_per_row, target_env_idx, target_offset, use_visual_geom, use_force",
     [
-        (0, (0.0, 0.0), None, None, (0.0, 0.0, 0.0), False),
+        (0, (0.0, 0.0), None, None, (0.0, 0.0, 0.0), False, True),
         # Two envs spaced along x so envs_offset is non-zero. Camera is positioned over env 1, so a viewport-center
         # click must pick env 1 (exercising kernel_cast_ray's per-env offset transform) and leave env 0 untouched.
-        (2, (0.5, 0.0), 1, 1, (0.25, 0.0, 0.0), False),
-        (2, (0.5, 0.0), 1, 1, (0.25, 0.0, 0.0), True),
+        (2, (0.5, 0.0), 1, 1, (0.25, 0.0, 0.0), False, True),
+        (2, (0.5, 0.0), 1, 1, (0.25, 0.0, 0.0), True, False),
     ],
 )
-def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_env_idx, target_offset, use_visual_geom):
+def test_mouse_interaction_plugin(
+    n_envs, env_spacing, n_envs_per_row, target_env_idx, target_offset, use_visual_geom, use_force, monkeypatch
+):
     DT = 0.01
     MASS = 100.0
     BOX_LENGTH = 0.2
@@ -399,9 +532,17 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
             fixed=True,
         ),
     )
+    # A plugin drawn before the mouse interaction one reports every draw of the plugins
+    is_drawing = threading.Event()
+
+    class DrawProbe(gs.vis.viewer_plugins.ViewerPlugin):
+        def on_draw(self):
+            is_drawing.set()
+
+    scene.viewer.add_plugin(DrawProbe())
     scene.viewer.add_plugin(
         gs.vis.viewer_plugins.MouseInteractionPlugin(
-            use_force=True,
+            use_force=use_force,
             spring_slack=SPRING_SLACK,
             use_visual_geom=use_visual_geom,
         )
@@ -414,6 +555,23 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
 
     pyrender_viewer = scene.visualizer.viewer._pyrender_viewer
     assert pyrender_viewer.is_active
+
+    # Without a spring, the plugin moves the held box during the step, which syncs the viewer. A threaded viewer
+    # starting to draw its plugins meanwhile would hold the render lock that this sync takes, while the mouse plugin
+    # waits for the step to finish with the box: neither thread would ever return. Such a draw is counted instead.
+    n_draws_while_moving = 0
+    if not use_force and pyrender_viewer.run_in_thread:
+        set_pos = box.set_pos
+
+        def set_pos_unless_drawing(*args, **kwargs):
+            nonlocal n_draws_while_moving
+            is_drawing.clear()
+            if is_drawing.wait(timeout=0.5):
+                n_draws_while_moving += 1
+            else:
+                set_pos(*args, **kwargs)
+
+        monkeypatch.setattr(box, "set_pos", set_pos_unless_drawing)
 
     # Sanity-check the scene actually applies the offset we want to exercise.
     if target_env_idx is not None:
@@ -470,6 +628,9 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
         y += DRAG_DY
         pyrender_viewer.dispatch_event("on_mouse_drag", x, y, 0, DRAG_DY, MouseButton.LEFT, 0)
         wait_for_viewer_events(pyrender_viewer, check_event_count())
+        # A setter called during the drag, as a controller running alongside would, must not release the grab, since a
+        # setter is not a step. The kinematic entity is set where it already stands, so the drag is all that moves.
+        kinematic.set_pos((0.0, KINEMATIC_LANE_Y, BOX_LENGTH / 2))
         scene.step()
         if (i + 1) % (STEPS // 2) == 0:
             rgb_arr, *_ = pyrender_viewer.render_offscreen(
@@ -477,6 +638,7 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
             )
             rgb_arrs.append(rgb_arr)
 
+    assert n_draws_while_moving == 0
     assert not np.array_equal(rgb_arrs[0], rgb_arrs[1]), "Expected images to be different after dragging the object."
 
     final_pos = tensor_to_array(box.get_pos())
@@ -497,9 +659,10 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
 
     displacement_z = final_pos_target[2] - initial_pos_target[2]
     assert displacement_z > gs.EPS, "Box should have moved upward"
-    assert displacement_z < total_world_displacement, (
-        "Box displacement should be less than mouse displacement from spring lag"
-    )
+    if use_force:
+        assert displacement_z < total_world_displacement, (
+            "Box displacement should be less than mouse displacement from spring lag"
+        )
 
     # Non-target envs (multi-env case) must not have moved.
     if target_env_idx is not None:
@@ -519,22 +682,27 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
     rgb_arr, *_ = pyrender_viewer.render_offscreen(
         pyrender_viewer._camera_node, pyrender_viewer._renderer, rgb=True, depth=False, seg=False, normal=False
     )
-    assert not np.array_equal(rgb_arrs[-1], rgb_arr), "Expected visualization to change after releasing the object."
+    if use_force:
+        assert not np.array_equal(rgb_arrs[-1], rgb_arr), "Expected visualization to change after releasing the object."
+    else:
+        # Moved without any velocity, the box stays where it is let go
+        assert_allclose(box.get_pos(), final_pos, tol=gs.EPS)
 
-    # The forces from mouse spring are approximate, so use a large tolerance.
-    # FIXME: Use a more accurate model to predict final velocity.
-    total_sim_time = STEPS * DT
-    avg_mouse_velocity = total_world_displacement / total_sim_time
-    num_tau = total_sim_time * np.sqrt(GRAB_ACC / SPRING_SLACK)
-    velocity_fraction = 1.0 - (1.0 + num_tau) * np.exp(-num_tau)
-    expected_vel_z = avg_mouse_velocity * velocity_fraction
+    if use_force:
+        # The forces from mouse spring are approximate, so use a large tolerance.
+        # FIXME: Use a more accurate model to predict final velocity.
+        total_sim_time = STEPS * DT
+        avg_mouse_velocity = total_world_displacement / total_sim_time
+        num_tau = total_sim_time * np.sqrt(GRAB_ACC / SPRING_SLACK)
+        velocity_fraction = 1.0 - (1.0 + num_tau) * np.exp(-num_tau)
+        expected_vel_z = avg_mouse_velocity * velocity_fraction
 
-    assert_allclose(
-        final_vel_target[2],
-        expected_vel_z,
-        rtol=0.5,
-        err_msg="Final z velocity does not match expected value based on spring dynamics.",
-    )
+        assert_allclose(
+            final_vel_target[2],
+            expected_vel_z,
+            rtol=0.5,
+            err_msg="Final z velocity does not match expected value based on spring dynamics.",
+        )
 
     probe_dir = (0.0, 0.0, -1.0)
     stack_probe = (target_offset[0], STACK_LANE_Y, PROBE_Z)
@@ -666,6 +834,12 @@ def test_add_camera_consistency(add_box, renderer, show_viewer):
         GUI=show_viewer,
     )
     scene.build()
+
+    # Both cameras compute the look-at pose in double precision, whatever the precision of the simulation, the camera
+    # handing it over in single precision
+    cam_pose = gu.pos_lookat_up_to_T(np.array(CAM_POS), np.array(CAM_LOOKAT), np.array((0.0, 0.0, 1.0)))
+    assert_equal(scene.viewer.camera_pose, cam_pose)
+    assert_equal(camera.transform, cam_pose.astype(np.float32))
 
     # Render from interactive viewer
     pyrender_viewer = scene.visualizer.viewer._pyrender_viewer
@@ -809,6 +983,7 @@ def test_thread_crash_reports_traceback():
         assert isinstance(exc_info.value.__cause__, RuntimeError)
         assert "Deliberate viewer thread crash." in str(exc_info.value.__cause__)
     else:
-        # Non-threaded: exception propagates directly through scene.step()
+        # Non-threaded: exception propagates directly through scene.step(), which redraws only once a refresh is due
+        time.sleep(1.0 / scene.viewer.refresh_rate)
         with pytest.raises(RuntimeError, match="Deliberate viewer thread crash."):
             scene.step()

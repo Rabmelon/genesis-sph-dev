@@ -41,10 +41,8 @@ from .conftest import (
 # ==================== Primitive Tests ====================
 
 
-@pytest.mark.slow  # ~450s
-@pytest.mark.required
 @pytest.mark.parametrize("model_name", ["all_primitives_mjcf"])
-@pytest.mark.parametrize("scale", [1.0, 2.0])
+@pytest.mark.parametrize("scale", [1.0, pytest.param(2.0, marks=pytest.mark.required)])
 def test_primitives_mjcf_vs_usd(xml_path, all_primitives_usd, scale, tol):
     mjcf_scene = build_mjcf_scene(xml_path, scale=scale)
     usd_scene = build_usd_scene(all_primitives_usd, scale=scale)
@@ -54,13 +52,9 @@ def test_primitives_mjcf_vs_usd(xml_path, all_primitives_usd, scale, tol):
 # ==================== Joint Tests ====================
 
 
-@pytest.mark.slow  # ~350s
-@pytest.mark.required
 @pytest.mark.parametrize("model_name", ["all_joints_mjcf"])
-@pytest.mark.parametrize("scale", [1.0, 2.0])
-@pytest.mark.parametrize(
-    "all_joints_usd", [True, False], indirect=True, ids=["with_articulation_root", "without_articulation_root"]
-)
+@pytest.mark.parametrize("scale", [1.0, pytest.param(2.0, marks=pytest.mark.required)])
+@pytest.mark.parametrize("all_joints_usd", [True, False], indirect=True)
 def test_joints_mjcf_vs_usd(xml_path, all_joints_usd, scale, tol):
     mjcf_scene = build_mjcf_scene(xml_path, scale=scale)
     usd_scene = build_usd_scene(all_joints_usd, scale=scale)
@@ -136,8 +130,7 @@ def test_bake(usd_file, tmp_path):
     assert is_any_baked
 
 
-@pytest.mark.required
-@pytest.mark.parametrize("scale", [1.0, 2.0])
+@pytest.mark.parametrize("scale", [1.0, pytest.param(2.0, marks=pytest.mark.required)])
 def test_massapi_invalid_defaults_mjcf_vs_usd(asset_tmp_path, scale):
     # USD Physics MassAPI defines attributes with sentinel default values - centerOfMass (-inf, -inf, -inf),
     # principalAxes (0, 0, 0, 0), diagonalInertia (0, 0, 0), mass (0) - that must be treated as unset and
@@ -341,7 +334,6 @@ def test_ur10_visual_fallback():
             assert link.n_vgeoms > 0, f"Link {link.name} has collision but no visual geometry (missing fallback)."
 
 
-@pytest.mark.slow  # ~250s
 @pytest.mark.required
 def test_humanoid_generic_joint_detection():
     asset_path = get_hf_dataset(pattern="usd/Humanoid/*")
@@ -404,7 +396,12 @@ def test_physics_material_friction_and_density(usd_scene, physics_material_usd):
     # Without an explicit material density, the authored physics-material density (300) and MassAPI
     # density (500) drive the link mass; recompute_inertia re-derives from geometry and authored
     # densities keep driving that estimate.
-    scene = gs.Scene()
+    # See build_mjcf_scene in conftest.py for collision detection.
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+    )
     entities = scene.add_stage(
         morph=gs.morphs.USD(
             file=physics_material_usd,
@@ -424,7 +421,12 @@ def test_physics_material_friction_and_density(usd_scene, physics_material_usd):
 
 @pytest.mark.required
 def test_align_anchor_with_geom_densities(density_align_usd):
-    scene = gs.Scene()
+    # See build_mjcf_scene in conftest.py for collision detection.
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+    )
     body = scene.add_entity(
         gs.morphs.USD(
             file=density_align_usd,
@@ -453,7 +455,12 @@ def test_align_anchor_with_geom_densities(density_align_usd):
 @pytest.mark.required
 @pytest.mark.parametrize("align, rho", [(True, None), (None, 1000.0), (None, None)])
 def test_align_requires_all_or_none_geom_densities(density_align_usd, align, rho):
-    scene = gs.Scene()
+    # See build_mjcf_scene in conftest.py for collision detection.
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+    )
 
     # A density authored on only part of a link's geoms leaves the anchor sensitive to the density the others take.
     # No kinematic entity holds such a density (see '_align_free_roots'), so an explicit align=True raises. The
@@ -511,7 +518,12 @@ def test_collision_approximations(usd_scene, collision_approximation_usd):
 
     # An authored 'none' pins the exact mesh: morph-level decimation only applies to colliders
     # without an authored approximation.
-    scene = gs.Scene()
+    # See build_mjcf_scene in conftest.py for collision detection.
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+    )
     entities = scene.add_stage(
         morph=gs.morphs.USD(
             file=collision_approximation_usd,
@@ -527,40 +539,32 @@ def test_collision_approximations(usd_scene, collision_approximation_usd):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("model_name", ["collision_filtering_usd"])
-def test_collision_filtering_masks(usd_scene):
-    assert len(usd_scene.entities) == 2
-    entities = {entity.links[0].name: entity for entity in usd_scene.entities}
-
-    # Masks synthesized from in-model filtering only apply within the entity, so collision against
-    # other entities (e.g. a ground plane) is preserved.
-    for entity in usd_scene.entities:
-        assert entity.is_local_collision_mask
-        for geom in entity.geoms:
-            assert geom.contype or geom.conaffinity
-
-    col_a, col_b = entities["/root/pair_body"].geoms
-    assert ((col_a.contype & col_b.conaffinity) | (col_b.contype & col_a.conaffinity)) == 0
-
-    col_c, col_d, col_e = entities["/root/group_body"].geoms
-    assert ((col_c.contype & col_d.conaffinity) | (col_d.contype & col_c.conaffinity)) == 0
-    assert ((col_c.contype & col_e.conaffinity) | (col_e.contype & col_c.conaffinity)) != 0
-    assert ((col_d.contype & col_e.conaffinity) | (col_e.contype & col_d.conaffinity)) != 0
-
-
-@pytest.mark.required
-def test_filtered_entity_still_collides_with_ground(collision_filtering_usd, show_viewer):
+def test_collision_filtering(collision_filtering_usd, show_viewer, caplog):
     scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_neutral_collision=True,
+            enable_adjacent_collision=True,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.5, -1.5, 1.0),
+            camera_lookat=(0.0, 0.5, 0.0),
+        ),
         show_viewer=show_viewer,
     )
-    scene.add_entity(gs.morphs.Plane())
-    entities = scene.add_stage(
-        morph=gs.morphs.USD(
-            file=collision_filtering_usd,
-            pos=(0.0, 0.0, 0.05),
-        ),
-    )
+    plane = scene.add_entity(gs.morphs.Plane())
+    with caplog.at_level("WARNING"):
+        entities = scene.add_stage(
+            morph=gs.morphs.USD(
+                file=collision_filtering_usd,
+                pos=(0.0, 0.0, 0.05),
+            ),
+        )
     scene.build()
+
+    # The link pairs whose colliders are filtered in part alone are reported together, once
+    partial_records = [record.getMessage() for record in caplog.records if "but not all of them" in record.getMessage()]
+    assert len(partial_records) == 1
+    assert "col_e" in partial_records[0] and "col_f" in partial_records[0]
 
     for _ in range(50):
         scene.step()
@@ -569,6 +573,19 @@ def test_filtered_entity_still_collides_with_ground(collision_filtering_usd, sho
     for entity in entities:
         aabb_min, _aabb_max = tensor_to_array(entity.get_AABB())
         assert -5e-4 < aabb_min[-1] < 0.0
+
+    # Every link rests on the ground. Among the links overlapping their base, those whose colliders are all filtered
+    # against it never collide with it, and those filtered in part alone keep colliding.
+    links_idx = {link.name: link.idx for entity in entities for link in entity.links}
+    contacts = scene.rigid_solver.collider.get_contacts(to_torch=False)
+    contact_link_pairs = {frozenset(link_pair) for link_pair in zip(contacts["link_a"], contacts["link_b"])}
+    assert contact_link_pairs == {
+        *[frozenset((plane.base_link_idx, i_l)) for i_l in links_idx.values()],
+        *[
+            frozenset((links_idx["/root/group_body/col_c"], links_idx[f"/root/group_body/{link_name}"]))
+            for link_name in ("col_e", "col_f")
+        ],
+    }
 
 
 @pytest.mark.required

@@ -17,6 +17,7 @@ from OpenGL.GL import *
 import pyglet
 
 import genesis as gs
+from genesis.utils.cache import get_cache_dir
 from genesis.utils.misc import get_default_screen
 from genesis.vis.keybindings import Key, KeyAction, Keybind, Keybindings, KeyMod
 from genesis.vis.viewer_plugins import EVENT_HANDLE_STATE, EVENT_HANDLED, ViewerPlugin
@@ -188,6 +189,7 @@ class Viewer(pyglet.window.Window):
         self._render_lock = RLock()
         self._initialized_event = Event()
         self._is_active = False
+        self._is_refreshing = False
         self._exception = None
         self._thread: Optional[Thread] = None
         self._run_in_thread = run_in_thread
@@ -631,7 +633,7 @@ class Viewer(pyglet.window.Window):
             from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 
             self._video_recorder = FFMPEG_VideoWriter(
-                filename=os.path.join(gs.utils.misc.get_cache_dir(), "tmp_video.mp4"),
+                filename=os.path.join(get_cache_dir(), "tmp_video.mp4"),
                 fps=self.viewer_flags["refresh_rate"],
                 size=self.viewport_size,
             )
@@ -834,7 +836,8 @@ class Viewer(pyglet.window.Window):
         if self._renderer is None:
             return
 
-        with self.render_lock if self._run_in_thread or not self.auto_start else nullcontext():
+        render_lock = self.render_lock if self._run_in_thread or not self.auto_start else nullcontext()
+        with render_lock:
             # Make OpenGL context current
             self.switch_to()
 
@@ -844,10 +847,13 @@ class Viewer(pyglet.window.Window):
             self.clear()
             self._render()
 
-        # Capture the recording frame right after the scene render, before any on-screen overlay (captions, help
-        # text, and the plugins' ImGui panel / gizmo) is drawn, so the video shows only the rendered scene.
-        if self.viewer_flags["record"]:
-            self._record()
+            # Capture the recording frame right after the scene render, before any on-screen overlay (captions, help
+            # text, and the plugins' ImGui panel / gizmo) is drawn, so the video shows only the rendered scene.
+            record_frame = self._read_record_frame() if self.viewer_flags["record"] else None
+
+        # The frame is encoded once the lock is released, so that a slow encoder does not hold up the simulation.
+        if record_frame is not None:
+            self._video_recorder.write_frame(record_frame)
 
         if self.viewer_flags["caption"] is not None:
             for caption in self.viewer_flags["caption"]:
@@ -870,8 +876,10 @@ class Viewer(pyglet.window.Window):
         # configs before that point, and a rejected config must not leave a plugin's GL/ImGui state dangling for the
         # next attempt (e.g. an ImGui frame opened but never ended). _initialized_event is set at the end of start().
         if self._initialized_event.is_set():
-            for plugin in self.plugins:
-                plugin.on_draw()
+            # The plugins read the scene, so a threaded render loop draws them only while the scene is not updated
+            with render_lock:
+                for plugin in self.plugins:
+                    plugin.on_draw()
 
     def on_resize(self, width: int, height: int) -> EVENT_HANDLE_STATE:
         """Resize the camera and trackball when the window is resized."""
@@ -1037,16 +1045,17 @@ class Viewer(pyglet.window.Window):
             data = self._renderer.jit.read_color_buf(*self._viewport_size, rgba=False)
             cv2.imwrite(filename, np.flip(data, axis=-1))
 
-    def _record(self):
-        """Append the current frame to the video, unless the simulation has not advanced since the last recorded
-        frame (e.g. while paused) so the recording does not accumulate duplicate frozen frames."""
+    def _read_record_frame(self):
+        """Read the current frame to append to the video, or None if the simulation has not advanced since the last
+        recorded frame (e.g. while paused) so the recording does not accumulate duplicate frozen frames."""
         t = self.gs_context.scene.sim.cur_step_global
         if t == self._last_recorded_t:
-            return
+            return None
         self._last_recorded_t = t
         data = self._renderer.jit.read_color_buf(*self._viewport_size, rgba=False)
-        if not np.all(data == 0.0):
-            self._video_recorder.write_frame(data)
+        if np.all(data == 0.0):
+            return None
+        return data
 
     def _rotate(self):
         """Animate the scene by rotating the camera."""
@@ -1380,32 +1389,40 @@ class Viewer(pyglet.window.Window):
         if viewer_thread != threading.current_thread():
             raise RuntimeError("'Viewer.refresh' can only be called from the thread that started the viewer.")
 
-        if self._run_in_thread:
-            time_next_frame = time.time() + 1.0 / self.viewer_flags["refresh_rate"]
-            while self._offscreen_event.wait(time_next_frame - time.time()):
-                self._event_loop_step_offscreen()
-                self._offscreen_event.clear()
+        # Dispatching the window events can run a GUI callback that calls a setter, which asks for a refresh in turn.
+        # That nested refresh is skipped, since it would start a new GUI frame inside the one being drawn.
+        if self._is_refreshing:
+            return
+        self._is_refreshing = True
+        try:
+            if self._run_in_thread:
+                time_next_frame = time.time() + 1.0 / self.viewer_flags["refresh_rate"]
+                while self._offscreen_event.wait(time_next_frame - time.time()):
+                    self._event_loop_step_offscreen()
+                    self._offscreen_event.clear()
 
-        self.switch_to()
+            self.switch_to()
 
-        # Dispatch input events before drawing, so the frame (and the ImGui overlay / gizmo it renders) reacts to the
-        # current mouse and keyboard state. Drawing first and dispatching afterwards leaves interactive controls one
-        # frame behind the cursor, which makes dragging the gizmo feel stuttery.
-        if sys.platform == "win32":
-            # even changing `platform_event_loop.step(0.0)` to 0.001 causes the viewer to hang on Windows
-            # this is a workaround on Windows. not sure if it's correct
-            time.sleep(0.001)
-        else:
-            pyglet.app.platform_event_loop.step(0.0)
+            # Dispatch input events before drawing, so the frame (and the ImGui overlay / gizmo it renders) reacts to
+            # the current mouse and keyboard state. Drawing first and dispatching afterwards leaves interactive controls
+            # one frame behind the cursor, which makes dragging the gizmo feel stuttery.
+            if sys.platform == "win32":
+                # even changing `platform_event_loop.step(0.0)` to 0.001 causes the viewer to hang on Windows
+                # this is a workaround on Windows. not sure if it's correct
+                time.sleep(0.001)
+            else:
+                pyglet.app.platform_event_loop.step(0.0)
 
-        self.dispatch_pending_events()
-        if self._is_active:
-            self.dispatch_events()
+            self.dispatch_pending_events()
+            if self._is_active:
+                self.dispatch_events()
 
-        pyglet.clock.tick()
+            pyglet.clock.tick()
 
-        if self._is_active:
-            self.flip()
+            if self._is_active:
+                self.flip()
+        finally:
+            self._is_refreshing = False
 
     def update_on_sim_step(self):
         # Call HOLD callbacks for all currently held keys

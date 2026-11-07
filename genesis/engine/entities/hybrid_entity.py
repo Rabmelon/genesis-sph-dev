@@ -2,15 +2,17 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
-import quadrants as qd
+import torch
+
 import trimesh
 
+import quadrants as qd
+
 import genesis as gs
-import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.urdf as uu
 from genesis.ext.urdfpy.urdf import URDF
-
+from genesis.utils.array_class import GeomsInfo, LinksState
 from genesis.utils.hybrid import (
     check_graph,
     compute_graph_attribute,
@@ -144,7 +146,7 @@ class HybridEntity(Entity):
                 part_soft_info.quat_local_to_global.from_numpy(np.asarray(quat_local_to_global, dtype=gs.np_float))
 
                 part_soft_init_positions = qd.field(dtype=gs.qd_vec3, shape=(part_soft.init_particles.shape[0],))
-                part_soft_init_positions.from_torch(gs.Tensor(part_soft.init_particles))
+                part_soft_init_positions.from_numpy(part_soft.init_particles)
 
                 self._part_soft_info = part_soft_info
                 self._part_soft_init_positions = part_soft_init_positions
@@ -221,7 +223,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             A tensor containing the position values of the rigid body's degrees of freedom.
         """
         return self._part_rigid.get_dofs_position(*args, **kwargs)
@@ -237,7 +239,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             A tensor containing the velocity values of the rigid body's degrees of freedom.
         """
         return self._part_rigid.get_dofs_velocity(*args, **kwargs)
@@ -253,7 +255,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             A tensor representing forces acting on the rigid body's degrees of freedom.
         """
         return self._part_rigid.get_dofs_force(*args, **kwargs)
@@ -269,7 +271,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             A tensor containing the control force values for the rigid body's degrees of freedom.
         """
         return self._part_rigid.get_dofs_control_force(*args, **kwargs)
@@ -307,7 +309,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             Control output for position adjustment of the rigid body's DOFs.
         """
         return self._part_rigid.control_dofs_position(*args, **kwargs)
@@ -323,7 +325,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             Control output for position adjustment of the rigid body's DOFs.
         """
         return self._part_rigid.control_dofs_position_velocity(*args, **kwargs)
@@ -339,7 +341,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             Control output for velocity adjustment of the rigid body's DOFs.
         """
         self._part_rigid.control_dofs_velocity(*args, **kwargs)
@@ -355,7 +357,7 @@ class HybridEntity(Entity):
 
         Returns
         -------
-        gs.Tensor
+        torch.Tensor
             Control output for force adjustment of the rigid body's DOFs.
         """
         self._part_rigid.control_dofs_force(*args, **kwargs)
@@ -371,7 +373,7 @@ class HybridEntity(Entity):
         # can only be called here (at sim build)
         if not self.material.use_default_coupling and self._muscle_group_cache is not None:
             self._part_soft.set_muscle(
-                muscle_group=gs.tensor(self._muscle_group_cache)
+                muscle_group=torch.tensor(self._muscle_group_cache, dtype=gs.tc_int, device=gs.device)
                 # no muscle direction as the soft body is actuated by rigid parts
             )
 
@@ -392,9 +394,7 @@ class HybridEntity(Entity):
             raise NotImplementedError
 
     @qd.kernel
-    def _kernel_update_soft_part_mpm(
-        self, f: qd.i32, geoms_info: array_class.GeomsInfo, links_state: array_class.LinksState
-    ):
+    def _kernel_update_soft_part_mpm(self, f: qd.i32, geoms_info: GeomsInfo, links_state: LinksState):
         for i_p_, i_b in qd.ndrange(self._part_soft.n_particles, self._part_soft._sim._B):
             if self._solver_soft.particles_ng[f, i_p_, i_b].active:
                 i_global = i_p_ + self._part_soft.particle_start

@@ -1,5 +1,3 @@
-import platform
-import sys
 from typing import TYPE_CHECKING, Any, Literal
 
 import quadrants as qd
@@ -13,7 +11,6 @@ if TYPE_CHECKING:
     from genesis.engine.entities.sph_entity import SPHEntity
 
 SamplerType = Literal["pbs", "random", "regular"]
-DEFAULT_SAMPLER: SamplerType = "pbs" if (sys.platform == "linux" and platform.machine() == "x86_64") else "random"
 
 
 @qd.data_oriented
@@ -28,8 +25,9 @@ class Base(Material["SPHEntity"]):
     Parameters
     ----------
     sampler : str, optional
-        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux x86 for now. Defaults
-        to 'pbs' on supported platforms, 'random' otherwise.
+        Particle sampler. Defaults to 'pbs', which relaxes the particles to a uniform density inside the shape, at the
+        cost of a slower first sampling of each shape, cached afterwards. 'regular' places them on a grid, which leaves
+        the surface stair-stepped. 'random' draws them uniformly, which leaves local density fluctuations.
     rho : float, optional
         The rest density (kg/m^3). Default is 1000.0.
     stiffness : float, optional
@@ -46,7 +44,7 @@ class Base(Material["SPHEntity"]):
         0.0.
     """
 
-    sampler: SamplerType = DEFAULT_SAMPLER
+    sampler: SamplerType = "pbs"
     rho: PositiveFloat = 1000.0
     stiffness: NonNegativeFloat = 0.0
     exponent: PositiveFloat = 1.0

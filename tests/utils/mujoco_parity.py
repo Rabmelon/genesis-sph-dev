@@ -1,10 +1,13 @@
+from collections.abc import Sequence
 from itertools import chain
-from typing import Literal, Sequence
+from typing import Literal
+
+import numpy as np
 
 import mujoco
-import numpy as np
 import pytest
 import scipy.optimize
+import scipy.sparse.csgraph
 
 import genesis as gs
 import genesis.utils.geom as gu
@@ -188,12 +191,16 @@ def init_paired_simulators(gs_sim, mj_sim, qpos=None, qvel=None):
     if qvel is not None:
         gs_sim.rigid_solver.set_dofs_velocity(qvel)
 
-    # The consistency checks compare pre-step derived quantities (bias forces, smooth accelerations), which only a
-    # dynamics pass populates on the Genesis side, mirroring the mj_forward call below.
-    gs_sim.rigid_solver.dyn_state.dofs.qf_constraint.fill(0.0)
-    gs_sim.rigid_solver._func_forward_dynamics()
-    gs_sim.rigid_solver._func_constraint_force()
-    gs_sim.rigid_solver._func_update_acc()
+    # The consistency checks compare pre-step derived quantities (bias forces, smooth and constrained accelerations),
+    # which a substep computes before integrating, mirroring the mj_forward call below. The initial state is then put
+    # back, keeping the contacts the substep detected at that same state.
+    rigid_solver = gs_sim.rigid_solver
+    qpos, dofs_vel = rigid_solver.get_qpos(), rigid_solver.get_dofs_velocity()
+    rigid_solver.substep(0)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rigid_solver.collider, "clear", lambda envs_idx=None: None)
+        rigid_solver.set_qpos(qpos)
+    rigid_solver.set_dofs_velocity(dofs_vel)
 
     if gs_sim.scene.visualizer:
         gs_sim.scene.visualizer.update()
@@ -710,7 +717,7 @@ def check_mujoco_data_consistency(
                 # Must relax tolerance because of compounding of errors.
                 assert_allclose(gs_improvement, mj_improvement, tol=tol * 1e2)
 
-    gs_qfrc_constraint = gs_sim.rigid_solver.dyn_state.dofs.qf_constraint.to_numpy()[:, 0]
+    gs_qfrc_constraint = gs_sim.rigid_solver.constraint_solver.qfrc_constraint.to_numpy()[:, 0]
     mj_qfrc_constraint = mj_sim.data.qfrc_constraint
     assert_allclose(gs_qfrc_constraint[gs_dofs_idx], mj_qfrc_constraint[mj_dofs_idx], atol=efc_atol, rtol=tol)
 
@@ -749,12 +756,23 @@ def check_mujoco_data_consistency(
     # Genesis mirrors in dofs.acc; the smooth+constraint acceleration is only observable on the remaining DOFs.
     midpoint_mask = get_mujoco_midpoint_dofs_mask(mj_sim)[mj_dofs_idx]
     gs_qacc_post = gs_sim.rigid_solver.dyn_state.dofs.acc.to_numpy()[:, 0]
-    assert_allclose(
-        gs_qacc_pre[gs_dofs_idx][~midpoint_mask], mj_qacc_pre[mj_dofs_idx][~midpoint_mask], atol=efc_atol, rtol=tol
-    )
-    assert_allclose(
-        gs_qacc_post[gs_dofs_idx][midpoint_mask], mj_qacc_pre[mj_dofs_idx][midpoint_mask], atol=efc_atol, rtol=tol
-    )
+    # The constraint solve rounds every acceleration at the scale of the largest one it is solved jointly with: the
+    # degrees of freedom (DOFs) of a kinematic tree, and the DOFs a constraint row couples. A small component of such a
+    # group spanning several decades carries that rounding as a relative error far above the tolerance.
+    mj_jac_mask = np.abs(mj_sim.data.efc_J.reshape((mj_sim.data.nefc, mj_sim.model.nv))) > 0.0
+    dofs_tree = mj_sim.model.dof_treeid
+    dofs_coupling = (dofs_tree[:, None] == dofs_tree[None]) | (mj_jac_mask.T @ mj_jac_mask)
+    n_groups, dofs_group = scipy.sparse.csgraph.connected_components(dofs_coupling, directed=False)
+    groups_qacc_max = np.zeros(n_groups)
+    np.maximum.at(groups_qacc_max, dofs_group, np.abs(mj_qacc_pre))
+    gs_qacc_pre, gs_qacc_post = gs_qacc_pre[gs_dofs_idx], gs_qacc_post[gs_dofs_idx]
+    mj_qacc_pre, dofs_group = mj_qacc_pre[mj_dofs_idx], dofs_group[mj_dofs_idx]
+    for i_group in range(n_groups):
+        qacc_atol = max(efc_atol, tol * groups_qacc_max[i_group])
+        is_pre = (dofs_group == i_group) & ~midpoint_mask
+        is_post = (dofs_group == i_group) & midpoint_mask
+        assert_allclose(gs_qacc_pre[is_pre], mj_qacc_pre[is_pre], atol=qacc_atol, rtol=tol)
+        assert_allclose(gs_qacc_post[is_post], mj_qacc_pre[is_post], atol=qacc_atol, rtol=tol)
 
     gs_qvel = gs_sim.rigid_solver.dyn_state.dofs.vel.to_numpy()[:, 0]
     mj_qvel = mj_sim.data.qvel

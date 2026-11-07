@@ -4,7 +4,7 @@ Camera sensors for rendering: Rasterizer, Raytracer, and Batch Renderer.
 
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, NamedTuple, Optional, Type
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -31,9 +31,10 @@ from genesis.vis.batch_renderer import BatchRenderer
 from genesis.vis.rasterizer import Rasterizer
 from genesis.vis.rasterizer_context import RasterizerContext
 
-from .base_sensor import OptionsT, KinematicSensorMetadataMixin, KinematicSensorMixin, Sensor, SharedSensorMetadata
+from .base_sensor import KinematicSensorMetadataMixin, KinematicSensorMixin, OptionsT, Sensor, SharedSensorMetadata
 
 if TYPE_CHECKING:
+    from genesis.ext.pyrender.mesh import Mesh
     from genesis.utils.ring_buffer import TensorRingBuffer
     from genesis.vis.batch_renderer import BatchRenderer
     from genesis.vis.rasterizer import Rasterizer
@@ -136,15 +137,15 @@ class RasterizerCameraSharedMetadata(KinematicSensorMetadataMixin, SharedSensorM
     """Shared metadata for all Rasterizer cameras."""
 
     # Rasterizer instance
-    renderer: Optional["Rasterizer"] = None
+    renderer: "Rasterizer | None" = None
     # RasterizerContext instance
-    context: Optional["RasterizerContext"] = None
+    context: "RasterizerContext | None" = None
     # List of light dictionaries
-    lights: Optional[List[Dict[str, Any]]] = None
+    lights: list[dict[str, Any]] | None = None
     # List of RasterizerCameraSensor instances
-    sensors: Optional[List["RasterizerCameraSensor"]] = None
+    sensors: list["RasterizerCameraSensor"] | None = None
     # {sensor_idx: np.ndarray with shape (B, H, W, 3)}
-    image_cache: Optional[Dict[int, np.ndarray]] = None
+    image_cache: dict[int, np.ndarray] | None = None
     # Track when rasterizer cameras were last updated
     last_render_timestep: int = -1
 
@@ -167,13 +168,13 @@ class RaytracerCameraSharedMetadata(KinematicSensorMetadataMixin, SharedSensorMe
     """Shared metadata for all Raytracer cameras."""
 
     # Raytracer instance
-    renderer: Optional["Raytracer"] = None
+    renderer: "Raytracer | None" = None
     # List of light objects
-    lights: Optional[List[Any]] = None
+    lights: list[Any] | None = None
     # List of RaytracerCameraSensor instances
-    sensors: Optional[List["RaytracerCameraSensor"]] = None
+    sensors: list["RaytracerCameraSensor"] | None = None
     # {sensor_idx: np.ndarray with shape (B, H, W, 3)}
-    image_cache: Optional[Dict[int, np.ndarray]] = None
+    image_cache: dict[int, np.ndarray] | None = None
     # Track when raytracer cameras were last updated
     last_render_timestep: int = -1
 
@@ -190,17 +191,17 @@ class BatchRendererCameraSharedMetadata(KinematicSensorMetadataMixin, SharedSens
     """Shared metadata for all Batch Renderer cameras."""
 
     # BatchRenderer instance
-    renderer: Optional["BatchRenderer"] = None
+    renderer: "BatchRenderer | None" = None
     # gs.List of lights
-    lights: Optional[Any] = None
+    lights: Any | None = None
     # List of BatchRendererCameraSensor instances
-    sensors: Optional[List["BatchRendererCameraSensor"]] = None
+    sensors: list["BatchRendererCameraSensor"] | None = None
     # {sensor_idx: np.ndarray with shape (B, H, W, 3)}
-    image_cache: Optional[Dict[int, np.ndarray]] = None
+    image_cache: dict[int, np.ndarray] | None = None
     # Track when batch was last rendered
     last_render_timestep: int = -1
     # MinimalVisualizerWrapper instance
-    visualizer_wrapper: Optional["MinimalVisualizerWrapper"] = None
+    visualizer_wrapper: "MinimalVisualizerWrapper | None" = None
 
     def destroy(self):
         super().destroy()
@@ -271,9 +272,9 @@ class BaseCameraSensor(KinematicSensorMixin, Sensor[OptionsT, None, SharedSensor
         # every environment. Extend the caching mechanism to be env-aware so envs_idx only refreshes the reset envs.
         shared_metadata.last_render_timestep = -1
 
-    def _draw_debug(self, context: "RasterizerContext"):
+    def _draw_debug(self, context: "RasterizerContext", envs_idx: list[int]) -> list[tuple[None, "Mesh", None]]:
         """No debug drawing for cameras."""
-        pass
+        return []
 
     # ========================== Attachment handling ==========================
 

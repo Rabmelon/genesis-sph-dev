@@ -1,13 +1,15 @@
+import atexit
 import io
+import logging as _logging
 import os
 import sys
-import atexit
-import logging as _logging
+import tempfile
 import traceback
 import weakref
-from typing import Callable
-from warnings import warn
+from collections.abc import Callable
 from contextlib import redirect_stdout
+from functools import partial
+from warnings import warn
 
 # Import quadrants while collecting its output without printing directly
 _qd_outputs = io.StringIO()
@@ -27,8 +29,8 @@ import numpy as np
 
 from .constants import backend as _gs_backend
 from .logging import Logger
+from .utils import ZeroCopyMode, get_device, redirect_libc_stderr, set_environ, set_random_seed
 from .version import __version__
-from .utils import redirect_libc_stderr, set_random_seed, get_device
 
 
 _IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
@@ -43,12 +45,11 @@ if _IS_OLD_TORCH:
 _initialized: bool = False
 _scene_registry: list[weakref.ReferenceType["Scene"]] = []
 _module_registry: set[tuple[Callable[[], None], Callable[[], None]]] = set()
-_theme: str | None = None
 logger: Logger | None = None
 device: torch.device | None = None
 backend: _gs_backend | None = None
 use_ndarray: bool | None = None
-use_zerocopy: bool | None = None
+use_zerocopy: ZeroCopyMode | None = None
 use_deterministic_algorithms: bool | None = None
 debug: bool | None = None
 EPS: float | None = None
@@ -66,7 +67,7 @@ def init(
     theme="dark",
     logger_verbose_time=False,
     performance_mode=False,
-    use_deterministic_algorithms=False,
+    use_deterministic_algorithms=None,
 ):
     global _initialized
     if _initialized:
@@ -75,35 +76,15 @@ def init(
     # Make sure everything is properly destroyed, just in case initialization failed previously
     destroy()
 
-    # Update theme if valid
-    global _theme
-    if theme not in ("dark", "light", "dumb"):
-        raise_exception(f"Unsupported theme: ~~<{theme}>~~")
-    _theme = theme
-
     # Make sure that specified arch and precision are supported
     if precision not in ("32", "64"):
-        raise_exception(f"Unsupported precision type: ~~<{precision}>~~")
+        raise_exception(f"Unsupported precision type: ~<{precision}>~")
 
-    # Initialize the logger and print greeting message
+    # Initialize the logger
     global logger
     if logging_level is None:
         logging_level = _logging.DEBUG if debug else _logging.INFO
-    logger = Logger(logging_level, logger_verbose_time)
-
-    try:
-        columns, _lines = os.get_terminal_size()
-    except OSError:
-        columns = 80
-    wave_width = (columns - logger.INFO_length - 11) // 2
-    if wave_width % 2 == 0:
-        wave_width -= 1
-    wave_width = max(0, min(38, wave_width))
-    bar_width = wave_width * 2 + 9
-    wave = ("┈┉" * wave_width)[:wave_width]
-    logger.info(f"~<╭{'─' * (bar_width)}╮>~")
-    logger.info(f"~<│{wave}>~ ~~~~<Genesis>~~~~ ~<{wave}│>~")
-    logger.info(f"~<╰{'─' * (bar_width)}╯>~")
+    logger = Logger(logging_level, logger_verbose_time, theme)
 
     # Get device and backend
     global device
@@ -120,12 +101,12 @@ def init(
         try:
             device, device_name, total_mem, _backend = get_device(_backend)
             if backend == _gs_backend.gpu and _backend == _gs_backend.cpu:
-                logger.warning(f"Backend ~~<{backend}>~~ not available on this machine. Falling back to CPU.")
+                logger.warning(f"Backend ~<{backend}>~ not available on this machine. Falling back to CPU.")
             backend = _backend
             break
         except GenesisException as e:
             if not backend_candidates:
-                raise_exception_from(f"Backend ~~<{_backend}>~~ not available on this machine.", e)
+                raise_exception_from(f"Backend ~<{_backend}>~ not available on this machine.", e)
     globals()["backend"] = backend
 
     # Fallback to Torch CPU device if requested
@@ -161,10 +142,13 @@ def init(
     else:
         if _use_zerocopy:
             raise_exception(f"Zero-copy not supported on {backend} backend.")
-    use_zerocopy = bool(_use_zerocopy)
+    use_zerocopy = ZeroCopyMode(_use_zerocopy)
 
     # Reproducing a rollout means settling the runtime-measured choices the simulation would otherwise keep revisiting
-    # (see prefer_decomposed_solver in rigid_solver.py), at the cost of the throughput they were buying, hence opt-in.
+    # (see prefer_decomposed_solver in rigid_solver.py), at the cost of the throughput they were buying. If None, it is
+    # resolved from the array mode: disabled in performance mode (static arrays), enabled otherwise.
+    if use_deterministic_algorithms is None:
+        use_deterministic_algorithms = _use_ndarray
     globals()["use_deterministic_algorithms"] = use_deterministic_algorithms
     globals()["debug"] = debug
 
@@ -200,24 +184,18 @@ def init(
         tc_bool = torch.bool
 
     # Let's use GLSL convention: https://learnwebgl.brown37.net/12_shader_language/glsl_data_types.html
-    global qd_vec2, qd_vec3, qd_vec4, qd_vec6, qd_vec7, qd_vec11, qd_mat3, qd_mat4, qd_ivec2, qd_ivec3, qd_ivec4
+    global qd_vec2, qd_vec3, qd_vec4, qd_vec6, qd_vec7, qd_vec18, qd_mat3, qd_mat4, qd_ivec2, qd_ivec3, qd_ivec4
     qd_vec2 = qd.types.vector(2, qd_float)
     qd_vec3 = qd.types.vector(3, qd_float)
     qd_vec4 = qd.types.vector(4, qd_float)
     qd_vec6 = qd.types.vector(6, qd_float)
     qd_vec7 = qd.types.vector(7, qd_float)
-    qd_vec11 = qd.types.vector(11, qd_float)
+    qd_vec18 = qd.types.vector(18, qd_float)
     qd_mat3 = qd.types.matrix(3, 3, qd_float)
     qd_mat4 = qd.types.matrix(4, 4, qd_float)
     qd_ivec2 = qd.types.vector(2, qd_int)
     qd_ivec3 = qd.types.vector(3, qd_int)
     qd_ivec4 = qd.types.vector(4, qd_int)
-
-    if use_deterministic_algorithms:
-        # TorchScript profiles the first calls of a scripted function unfused, then compiles a fused kernel whose
-        # contracted arithmetic rounds differently, so a getter built on one returns different bits for the same state
-        # depending on how many times it has run. With no fused specialization allowed, every call runs unfused.
-        torch.jit.set_fusion_strategy([("STATIC", 0), ("DYNAMIC", 0)])
 
     # Define smallest float that is considered non-zero
     global EPS
@@ -257,6 +235,27 @@ def init(
             cpu_max_num_threads=1,
         )
 
+    # The kernels compiled for a couple of scenes outgrow the default size bound of the offline cache of Quadrants, past
+    # which a quarter of the cached kernels are evicted every time Quadrants shuts down, to be compiled again by the
+    # next session.
+    # FIXME: quadrants#980 - The bound is a 32-bit integer, which caps it at 2 GiB, so a working set larger than that
+    # still gets evicted.
+    if "QD_OFFLINE_CACHE_MAX_SIZE_OF_FILES" not in os.environ:
+        qd_init_kwargs.update(
+            offline_cache_max_size_of_files=2**31 - 1,
+        )
+
+    # Environment variables read by Quadrants while initializing, set for the duration of its initialization only.
+    # FIXME: quadrants#983 - Buffers from the HIP memory pool fault on their first write on RDNA4 GPUs (gfx12), so
+    # Quadrants allocates through plain hipMalloc there, at the cost of reserving its device memory budget at init.
+    qd_init_environ = {}
+    if (
+        backend == _gs_backend.amdgpu
+        and "QD_ENABLE_HIP_MEMPOOL" not in os.environ
+        and torch.cuda.get_device_properties().gcnArchName.startswith("gfx12")
+    ):
+        qd_init_environ["QD_ENABLE_HIP_MEMPOOL"] = "0"
+
     if seed is not None:
         global SEED
         SEED = seed
@@ -265,54 +264,63 @@ def init(
             random_seed=seed,
         )
 
+    # Level of Genesis each level of the messages of Quadrants is logged at, one step below to unify logging management.
+    # Its native logger starts every message with the first letter of the level name, as in '[W 10/19/26 10:07:01 ...'.
+    qd_log_levels = {
+        "trace": _logging.DEBUG,
+        "debug": _logging.DEBUG,
+        "info": _logging.DEBUG,
+        "warn": _logging.INFO,
+        "error": _logging.WARNING,
+        "critical": _logging.ERROR,
+    }
+    qd_native_log_levels = {qd_name[0].upper(): level for qd_name, level in qd_log_levels.items()}
+
     # init quadrants
     qd_debug = debug and (os.environ.get("QD_DEBUG") != "0")
-    with redirect_stdout(_qd_outputs):
-        qd.init(
-            arch=getattr(qd, backend.name),
-            enable_fallback=False,
-            # Add a (hidden) mechanism to forcible disable Quadrants debug mode as it is still a bit experimental
-            debug=qd_debug and backend == _gs_backend.cpu,
-            check_out_of_bound=debug and backend != _gs_backend.metal,
-            # force_scalarize_matrix=True for speeding up kernel compilation
-            # FIXME: Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
-            force_scalarize_matrix=True,
-            # FIXME: Turning off 'advanced_optimization' is causing issues on MacOS
-            advanced_optimization=True,
-            # This improves runtime speed by around 1%-5%, while it makes compilation up to 6x slower
-            cfg_optimization=False,
-            fast_math=not debug,
-            default_ip=qd_int,
-            default_fp=qd_float,
-            # This feature is necessary to support auto-diff with non-static for-loop:
-            # * Up to 500MiB static upper-bound mem alloc per kernel before switching to tight runtime-based bound
-            ad_stack_sparse_threshold_bytes=200_000_000,
-            ad_stack_experimental_enabled=True,
-            **qd_init_kwargs,
-        )
+    # The native logger of Quadrants writes to the stderr file descriptor directly, before its Python logger is
+    # redirected to ours below, so what it prints while initializing is collected there as well, except on Windows where
+    # it writes to the standard error handle of the process (see 'redirect_libc_stderr').
+    with tempfile.TemporaryFile(mode="w+") as qd_errors:
+        with redirect_stdout(_qd_outputs), redirect_libc_stderr(qd_errors), set_environ(qd_init_environ):
+            qd.init(
+                arch=getattr(qd, backend.name),
+                enable_fallback=False,
+                # Add a (hidden) mechanism to forcible disable Quadrants debug mode as it is still a bit experimental
+                debug=qd_debug and backend == _gs_backend.cpu,
+                check_out_of_bound=debug and backend != _gs_backend.metal,
+                # force_scalarize_matrix=True for speeding up kernel compilation
+                # FIXME: Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
+                force_scalarize_matrix=True,
+                # FIXME: Turning off 'advanced_optimization' is causing issues on MacOS
+                advanced_optimization=True,
+                # This improves runtime speed by around 1%-5%, while it makes compilation up to 6x slower
+                cfg_optimization=False,
+                fast_math=not debug,
+                default_ip=qd_int,
+                default_fp=qd_float,
+                # This feature is necessary to support auto-diff with non-static for-loop:
+                # * Up to 500MiB static upper-bound mem alloc per kernel before switching to tight runtime-based bound
+                ad_stack_sparse_threshold_bytes=200_000_000,
+                ad_stack_experimental_enabled=True,
+                **qd_init_kwargs,
+            )
+        for qd_output in _qd_outputs.getvalue().splitlines():
+            logger.debug(qd_output)
+        # A line without the letter of a level is part of an error (see 'qd_native_log_levels')
+        qd_errors.seek(0)
+        for qd_error in qd_errors.read().splitlines():
+            level_letter = qd_error[1:2] if qd_error.startswith("[") else None
+            logger.log(qd_native_log_levels.get(level_letter, _logging.WARNING), qd_error)
+    _qd_outputs.truncate(0)
+    _qd_outputs.seek(0)
 
     # Disable debug checks for quadrants
     qd.lang._template_mapper.__builtins__["__debug__"] = qd_debug
 
-    logger.info(
-        f"Running on ~~<[{device_name}]>~~ with backend ~~<{backend}>~~. Device memory: ~~<{total_mem:.2f}>~~ GB."
-    )
-
-    for qd_output in _qd_outputs.getvalue().splitlines():
-        logger.debug(qd_output)
-    _qd_outputs.truncate(0)
-    _qd_outputs.seek(0)
-
-    # Redirect Quadrants logging messages to unify logging management
-    for qd_name, gs_name in (
-        ("debug", "debug"),
-        ("trace", "debug"),
-        ("info", "debug"),
-        ("warn", "info"),
-        ("error", "warning"),
-        ("critical", "error"),
-    ):
-        setattr(qd._logging, qd_name, getattr(logger, gs_name))
+    # Redirect Quadrants logging messages to unify logging management (see 'qd_log_levels')
+    for qd_name, level in qd_log_levels.items():
+        setattr(qd._logging, qd_name, partial(logger.log, level))
 
     # Dealing with default backend
     if use_ndarray:
@@ -330,19 +338,7 @@ def init(
             "runtime performance: https://pytorch.org/get-started/locally/"
         )
 
-    msg_options = ", ".join(
-        f"{name}: ~~<{val}>~~"
-        for name, val in (
-            ("🔖 version", __version__),
-            ("🎨 theme", theme),
-            ("🌱 seed", seed),
-            ("🐛 debug", bool(debug)),
-            ("📏 precision", precision),
-            ("🔥 performance", bool(performance_mode)),
-            ("💬 verbose", _logging.getLevelName(logger.level)),
-        )
-    )
-    logger.info(f"🚀 Genesis initialized. {msg_options}")
+    logger.banner(device_name, backend, total_mem, seed, debug, precision, performance_mode)
 
     if _use_zerocopy is None:
         logger.warning(
@@ -383,7 +379,7 @@ def destroy():
     # Display any buffered error message if logger is configured
     global logger
     if logger:
-        logger.info("💤 Exiting Genesis and caching compiled kernels...")
+        logger.shutdown()
 
     # Destroy all scenes. A weakref that no longer resolves means the scene was already garbage-collected (and its
     # resources released), so there is nothing left to destroy - skip it rather than asserting.
@@ -420,8 +416,7 @@ def destroy():
     logger = None
 
     # Clear global state
-    global _theme, device, backend, EPS
-    _theme = None
+    global device, backend, EPS
     device = None
     backend = None
     EPS = None
@@ -470,7 +465,7 @@ sys.excepthook = _custom_excepthook
 
 from .ext import _trimesh_patch
 from .utils.misc import get_src_dir as _get_src_dir
-from .utils.misc import clear_caches as _clear_caches
+from .utils.cache import clear_caches as _clear_caches
 
 # Eagerly load native extensions under redirected stderr to silence dlopen-time noise (e.g. macOS
 # objc duplicate-class warnings when several libraries ship their own copy of GLFW).
@@ -522,7 +517,6 @@ from .options import surfaces
 from .options import textures
 
 from .datatypes import List
-from .grad.creation_ops import *
 
 from .engine import states, materials, force_fields
 from .engine.mesh import Mesh

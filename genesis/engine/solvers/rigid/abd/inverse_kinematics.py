@@ -10,8 +10,10 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.linalg as lu
-import genesis.utils.array_class as array_class
 from genesis.engine.solvers.rigid.abd.forward_kinematics import func_forward_kinematics_root
+from genesis.utils.array_class import DynInfo, DynState, IKScratchFK, IKState, IKTargets, RigidInfo
+from genesis.utils.data import eoa
+from genesis.utils.misc import qd_isfinite
 
 
 @qd.func
@@ -28,9 +30,9 @@ def func_forward_kinematics_scratch(
     links_quat: qd.Tensor,
     joints_xanchor: qd.Tensor,
     joints_xaxis: qd.Tensor,
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
     """Forward kinematics of one entity on caller-owned scratch buffers.
@@ -140,7 +142,7 @@ def func_jacobian_scratch(
     jacobian: qd.Tensor,
     joints_xanchor: qd.Tensor,
     joints_xaxis: qd.Tensor,
-    dyn_info: array_class.DynInfo,
+    dyn_info: DynInfo,
     rigid_config: qd.template(),
 ):
     """Spatial Jacobian (6 x n_dofs) of the goal point at column i_col.
@@ -196,8 +198,8 @@ def func_get_jacobian(
     dof_start: int,
     p_local: qd.types.vector(3),
     jacobian: qd.Tensor,
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
     rigid_config: qd.template(),
 ):
     """Full spatial Jacobian (6 x n_dofs) of a target link's local point.
@@ -265,8 +267,8 @@ def kernel_get_jacobian(
     dof_start: int,
     p_local: qd.types.ndarray(),
     jacobian: qd.Tensor,
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
     rigid_config: qd.template(),
     n_batch: int,
 ):
@@ -282,8 +284,8 @@ def kernel_get_jacobian_zero(
     tgt_link_idx: int,
     dof_start: int,
     jacobian: qd.Tensor,
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
     rigid_config: qd.template(),
     n_batch: int,
 ):
@@ -303,8 +305,8 @@ def func_integrate_dq_scratch(
     q_offset: int,
     dq: qd.Tensor,
     qpos: qd.Tensor,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
     respect_joint_limit: int,
 ):
@@ -365,12 +367,12 @@ def func_inverse_kinematics(
     q_offset: int,
     link_offset: int,
     joint_offset: int,
-    dyn_state: array_class.DynState,
-    ik_state: array_class.IKState,
-    fk: array_class.IKScratchFK,
-    targets: array_class.IKTargets,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    ik_state: IKState,
+    fk: IKScratchFK,
+    targets: IKTargets,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
     n_qs: int,
     entity_n_dofs: int,
@@ -407,7 +409,7 @@ def func_inverse_kinematics(
         # Seed the working configuration from the requested initial guess or the live solver configuration.
         for i_q in range(n_qs):
             if custom_init_qpos:
-                fk.qpos[i_q, i_b] = targets.init_qpos[i_b, i_q]
+                fk.qpos[i_q, i_b] = targets.init_qpos[i_q, i_b]
             else:
                 fk.qpos[i_q, i_b] = rigid_info.qpos[i_q + q_offset, i_b]
 
@@ -643,7 +645,7 @@ def func_inverse_kinematics(
                             if (
                                 dyn_info.joints.type[I_j] == gs.JOINT_TYPE.REVOLUTE
                                 or dyn_info.joints.type[I_j] == gs.JOINT_TYPE.PRISMATIC
-                            ) and not (qd.math.isinf(dof_limit[0]) or qd.math.isinf(dof_limit[1])):
+                            ) and qd_isfinite(dof_limit):
                                 q_start = dyn_info.joints.q_start[I_j]
                                 # Counter-based draw keyed on (env, restart, DOF): a qd.random() per-thread stream
                                 # would order by the parallel schedule, making the resampled - and returned -
@@ -659,12 +661,12 @@ def kernel_inverse_kinematics_entity(
     q_offset: int,
     link_offset: int,
     joint_offset: int,
-    dyn_state: array_class.DynState,
-    ik_state: array_class.IKState,
-    fk: array_class.IKScratchFK,
-    targets: array_class.IKTargets,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    ik_state: IKState,
+    fk: IKScratchFK,
+    targets: IKTargets,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
     n_qs: int,
     entity_n_dofs: int,
@@ -724,7 +726,7 @@ def kernel_set_ik_targets(
     rot_mask: qd.types.ndarray(),
     link_pos_mask: qd.types.ndarray(),
     link_rot_mask: qd.types.ndarray(),
-    targets: array_class.IKTargets,
+    targets: IKTargets,
 ):
     """Copy externally supplied inverse-kinematics targets into the solver-side struct (non-zero-copy fallback)."""
     for i_ee in range(links_idx.shape[0]):
@@ -743,7 +745,7 @@ def kernel_set_ik_targets(
     for i_c in range(envs_idx.shape[0]):
         targets.envs_idx[i_c] = envs_idx[i_c]
         for i_q in range(init_qpos.shape[1]):
-            targets.init_qpos[envs_idx[i_c], i_q] = init_qpos[i_c, i_q]
+            targets.init_qpos[i_q, envs_idx[i_c]] = init_qpos[i_c, i_q]
     for k in qd.static(range(3)):
         targets.pos_mask[k] = pos_mask[k]
         targets.rot_mask[k] = rot_mask[k]
@@ -759,9 +761,9 @@ def kernel_forward_kinematics_query(
     links_quat: qd.types.ndarray(),
     qpos: qd.types.ndarray(),
     qpos_cache: qd.Tensor,
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
     """Link poses of one entity at a queried configuration, leaving the live configuration as it was.
@@ -771,7 +773,7 @@ def kernel_forward_kinematics_query(
     indices index it directly.
     """
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_q_, i_b_ in qd.ndrange(qs_idx.shape[0], envs_idx.shape[0]):
+    for i_q_, i_b_ in qd.ndrange(qs_idx.shape[0], envs_idx.shape[0], axes=qd.static(eoa(rigid_info.qpos))):
         qpos_cache[qs_idx[i_q_], envs_idx[i_b_]] = rigid_info.qpos[qs_idx[i_q_], envs_idx[i_b_]]
         rigid_info.qpos[qs_idx[i_q_], envs_idx[i_b_]] = qpos[i_b_, i_q_]
 
@@ -786,14 +788,14 @@ def kernel_forward_kinematics_query(
         )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l_, i_b_ in qd.ndrange(links_idx.shape[0], envs_idx.shape[0]):
+    for i_l_, i_b_ in qd.ndrange(links_idx.shape[0], envs_idx.shape[0], axes=qd.static(eoa(dyn_state.links.pos))):
         for i in qd.static(range(3)):
             links_pos[i_b_, i_l_, i] = dyn_state.links.pos[links_idx[i_l_], envs_idx[i_b_]][i]
         for i in qd.static(range(4)):
             links_quat[i_b_, i_l_, i] = dyn_state.links.quat[links_idx[i_l_], envs_idx[i_b_]][i]
 
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_q_, i_b_ in qd.ndrange(qs_idx.shape[0], envs_idx.shape[0]):
+    for i_q_, i_b_ in qd.ndrange(qs_idx.shape[0], envs_idx.shape[0], axes=qd.static(eoa(rigid_info.qpos))):
         rigid_info.qpos[qs_idx[i_q_], envs_idx[i_b_]] = qpos_cache[qs_idx[i_q_], envs_idx[i_b_]]
 
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)

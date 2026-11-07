@@ -8,7 +8,7 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-import genesis.utils.array_class as array_class
+from genesis.utils.array_class import ColliderInfo, ColliderState, DynInfo, GJKState
 from . import support_field
 
 
@@ -20,9 +20,9 @@ def support_mesh(
     direction: qd.types.vector(3),
     pos: qd.types.vector(3),
     quat: qd.types.vector(4),
-    gjk_state: array_class.GJKState,
-    dyn_info: array_class.DynInfo,
-    collider_info: array_class.ColliderInfo,
+    gjk_state: GJKState,
+    dyn_info: DynInfo,
+    collider_info: ColliderInfo,
 ):
     """
     Find the support point on a mesh in the given direction.
@@ -37,7 +37,7 @@ def support_mesh(
     vert_end = dyn_info.geoms.vert_end[i_g]
 
     # Use the previous maximum vertex if it is within the current range
-    prev_imax = gjk_state.support_mesh_prev_vertex_id[i_b, i_o]
+    prev_imax = gjk_state.support_mesh_prev_vertex_id[i_o, i_b]
     if (prev_imax >= vert_start) and (prev_imax < vert_end):
         pos_local = dyn_info.verts.init_pos[prev_imax]
         fmax = d_mesh.dot(pos_local)
@@ -53,10 +53,10 @@ def support_mesh(
     v = dyn_info.verts.init_pos[imax]
     vid = imax
 
-    gjk_state.support_mesh_prev_vertex_id[i_b, i_o] = vid
+    gjk_state.support_mesh_prev_vertex_id[i_o, i_b] = vid
 
     v_world = gu.qd_transform_by_trans_quat(v, pos, quat)
-    return v_world, vid
+    return v_world, v, vid
 
 
 @qd.func
@@ -67,12 +67,12 @@ def support_driver(
     direction: qd.types.vector(3),
     pos: qd.types.vector(3),
     quat: qd.types.vector(4),
-    collider_state: array_class.ColliderState,
-    gjk_state: array_class.GJKState,
-    dyn_info: array_class.DynInfo,
-    collider_info: array_class.ColliderInfo,
+    collider_state: ColliderState,
+    gjk_state: GJKState,
+    dyn_info: DynInfo,
+    collider_info: ColliderInfo,
     rigid_config: qd.template(),
-    collider_static_config: qd.template(),
+    collider_config: qd.template(),
     shrink_sphere: bool,
 ):
     """
@@ -94,20 +94,19 @@ def support_driver(
     elif geom_type == gs.GEOM_TYPE.BOX:
         v, v_, vid = support_field._func_support_box(i_g, direction, pos, quat, dyn_info)
     elif geom_type == gs.GEOM_TYPE.TERRAIN:
-        if qd.static(collider_static_config.has_terrain):
+        if qd.static(collider_config.has_terrain):
             v, vid = support_field._func_support_prism(i_b, direction, collider_state)
-    elif geom_type == gs.GEOM_TYPE.MESH and rigid_config.enable_mujoco_compatibility:
+    elif qd.static(rigid_config.enable_mujoco_compatibility):
         # If mujoco-compatible, do exhaustive search for the vertex
-        v, vid = support_mesh(i_g, i_b, i_o, direction, pos, quat, gjk_state, dyn_info, collider_info)
+        if geom_type == gs.GEOM_TYPE.MESH:
+            v, v_, vid = support_mesh(i_g, i_b, i_o, direction, pos, quat, gjk_state, dyn_info, collider_info)
+        else:
+            v, v_, vid = support_field._func_support_world(
+                i_g, direction, pos, quat, dyn_info, collider_info, exhaustive=True
+            )
     else:
         v, v_, vid = support_field._func_support_world(
-            i_g,
-            direction,
-            pos,
-            quat,
-            dyn_info,
-            collider_info,
-            exhaustive=qd.static(rigid_config.enable_mujoco_compatibility),
+            i_g, direction, pos, quat, dyn_info, collider_info, exhaustive=False
         )
     return v, v_, vid
 
@@ -122,12 +121,12 @@ def func_support(
     quat_a: qd.types.vector(4),
     pos_b: qd.types.vector(3),
     quat_b: qd.types.vector(4),
-    collider_state: array_class.ColliderState,
-    gjk_state: array_class.GJKState,
-    dyn_info: array_class.DynInfo,
-    collider_info: array_class.ColliderInfo,
+    collider_state: ColliderState,
+    gjk_state: GJKState,
+    dyn_info: DynInfo,
+    collider_info: ColliderInfo,
     rigid_config: qd.template(),
-    collider_static_config: qd.template(),
+    collider_config: qd.template(),
     shrink_sphere: bool,
 ):
     """
@@ -151,7 +150,7 @@ def func_support(
         pos = pos_a if i == 0 else pos_b
         quat = quat_a if i == 0 else quat_b
 
-        sp, sp_, si = support_driver(
+        support_pos, support_localpos, support_id = support_driver(
             i_g,
             i_b,
             i,
@@ -163,18 +162,18 @@ def func_support(
             dyn_info,
             collider_info,
             rigid_config,
-            collider_static_config,
+            collider_config,
             shrink_sphere,
         )
 
         if i == 0:
-            support_point_obj1 = sp
-            support_point_id_obj1 = si
-            support_point_localpos1 = sp_
+            support_point_obj1 = support_pos
+            support_point_id_obj1 = support_id
+            support_point_localpos1 = support_localpos
         else:
-            support_point_obj2 = sp
-            support_point_id_obj2 = si
-            support_point_localpos2 = sp_
+            support_point_obj2 = support_pos
+            support_point_id_obj2 = support_id
+            support_point_localpos2 = support_localpos
 
     support_point_minkowski = support_point_obj1 - support_point_obj2
 

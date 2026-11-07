@@ -9,7 +9,7 @@ import av
 import genesis as gs
 from genesis.utils.image_exporter import as_grayscale_image
 
-from ..utils.assertions import assert_allclose, rgb_array_to_png_bytes
+from ..utils.assertions import assert_allclose, assert_equal, rgb_array_to_png_bytes
 
 
 @pytest.fixture
@@ -230,13 +230,13 @@ def test_file_writers(tmp_path):
 
     csv_array_file = tmp_path / "array_data.csv"
     scene.add_recorder(
-        data_func=lambda: {"batch": np.arange(6).reshape(2, 3)},
+        data_func=lambda: {"batch": np.arange(6).reshape(2, 3), "scale": np.float32(0.5)},
         rec_options=gs.recorders.CSVFile(filename=csv_array_file),
     )
 
     npz_file = tmp_path / "scene_data.npz"
     scene.add_recorder(
-        data_func=lambda: {"box_pos": box.get_pos(), "dummy": 1},
+        data_func=lambda: {"box_pos": box.get_pos(), "dummy": 1, "scale": np.float32(0.5)},
         rec_options=gs.recorders.NPZFile(filename=npz_file),
     )
 
@@ -249,7 +249,10 @@ def test_file_writers(tmp_path):
     timings = scene.timings
     assert timings["physics"] > 0.0 and timings["recorders"] > 0.0
     assert timings["sensors"] >= timings[f"sensors/{type(contact_sensor).__name__}"] > 0.0
-    assert timings["total"] >= sum(time for phase, time in timings.items() if phase != "total" and "/" not in phase)
+    assert timings["step"] >= sum(
+        time for phase, time in timings.items() if phase not in ("step", "period") and "/" not in phase
+    )
+    assert timings["period"] > 0.0
 
     scene.stop_recording()
 
@@ -272,19 +275,32 @@ def test_file_writers(tmp_path):
         reader = csv.reader(f)
         rows = list(reader)
 
-        assert rows[0] == ["timestamp", "batch_0", "batch_1", "batch_2", "batch_3", "batch_4", "batch_5"]
-        assert rows[1][1:] == ["0", "1", "2", "3", "4", "5"]
+        assert rows[0] == ["timestamp", "batch_0", "batch_1", "batch_2", "batch_3", "batch_4", "batch_5", "scale"]
+        assert rows[1][1:] == ["0", "1", "2", "3", "4", "5", "0.5"]
 
     assert npz_file.exists()
     data = np.load(npz_file)
     assert "timestamp" in data
     assert "box_pos" in data
     assert "dummy" in data
+    assert_allclose(data["scale"], 0.5, tol=gs.EPS)
     assert len(data["timestamp"]) == STEPS + 1
+
+    # A step a pre-step callback vetoes leaves no trace, and the next step measures its period from the last one that
+    # advanced, the vetoed one in between included
+    timings = scene.timings
+    is_paused = True
+    scene.register_pre_step_callback(lambda: is_paused)
+    scene.step()
+    assert scene.timings.keys() == timings.keys()
+    assert_equal(list(scene.timings.values()), list(timings.values()))
+    is_paused = False
+    scene.step()
+    assert scene.timings["period"] > timings["step"] > 0.0
 
 
 @pytest.mark.required
-def test_error_handling(tmp_path):
+def test_error_handling(tmp_path, caplog):
     scene = gs.Scene(
         show_viewer=False,
     )
@@ -360,8 +376,11 @@ def test_error_handling(tmp_path):
         scene.step()
     with pytest.raises(gs.GenesisException, match="Unsupported data type"):
         scene.step()
-    # A reset restarts the recorders that did not fail
-    scene.reset()
+    # A reset leaves the recorders that failed out, and the others keep recording through it
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        scene.reset()
+    assert len(caplog.records) == 0
     scene.step()
     scene.step()
 
