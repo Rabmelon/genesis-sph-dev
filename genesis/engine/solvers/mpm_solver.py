@@ -17,7 +17,7 @@ from genesis.grad.bridge import no_grad, register_custom_backward
 from genesis.options.solvers import MPMOptions
 from genesis.utils.array_class import ErrorCode, GeomsInfo, GeomsState, LinksState, RigidInfo, SDFInfo
 from genesis.utils.data import ArrayItem, DataKind, opt_in
-from genesis.utils.misc import DeprecationError, broadcast_tensor, qd_isfinite, qd_to_torch
+from genesis.utils.misc import DeprecationError, broadcast_tensor, qd_isfinite, qd_to_torch, qd_zero_grad
 
 from .particle_solver import ParticleSolver
 
@@ -211,8 +211,9 @@ class MPMSolver(ParticleSolver):
         self.particle_constraints.link_idx.fill(-1)
 
     def reset_grad(self):
-        self.particles.grad.fill(0.0)
-        self.grid.grad.fill(0.0)
+        if self._requires_grad:
+            qd_zero_grad(self.particles)
+            qd_zero_grad(self.grid)
 
     def build(self):
         super().build()
@@ -504,13 +505,13 @@ class MPMSolver(ParticleSolver):
                         sep_geom_idx = self._coupler.cpic_flag[i_p, offset[0], offset[1], offset[2], i_b]
                         if sep_geom_idx != -1:
                             grid_vel = self.sim.coupler._func_collide_in_rigid_geom(
-                                self.particles[f, i_p, i_b].pos,
-                                self.particles[f, i_p, i_b].vel,
-                                self.particles_info[i_p].mass * weight / self._particle_volume_scale,
-                                self._coupler.mpm_rigid_normal[i_p, sep_geom_idx, i_b],
-                                1.0,
                                 sep_geom_idx,
                                 i_b,
+                                self.particles[f, i_p, i_b].pos,
+                                self.particles[f, i_p, i_b].vel,
+                                mass=self.particles_info[i_p].mass * weight / self._particle_volume_scale,
+                                normal_rigid=self._coupler.mpm_rigid_normal[i_p, sep_geom_idx, i_b],
+                                influence=1.0,
                                 geoms_info=geoms_info,
                                 links_state=links_state,
                                 rigid_info=rigid_info,
@@ -764,8 +765,8 @@ class MPMSolver(ParticleSolver):
         particle_start: qd.i32,
         n_particles: qd.i32,
         material_idx: qd.i32,
-        mat_default_Jp: qd.f32,
-        mat_rho: qd.f32,
+        mat_default_Jp: float,
+        mat_rho: float,
         pos: qd.types.ndarray(),  # shape [n_particles, 3]
     ):
         for i_p_ in range(n_particles):
@@ -875,9 +876,9 @@ class MPMSolver(ParticleSolver):
                     self.particles[0, i_p, i_b].pos[i] = poss[i_b_, i_p_, i]
 
                 # Reset these attributes whenever overwriting particle positions manually
-                self.particles[0, i_p, i_b].vel.fill(0.0)
+                self.particles[0, i_p, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
                 self.particles[0, i_p, i_b].F = qd.Matrix.identity(gs.qd_float, 3)
-                self.particles[0, i_p, i_b].C.fill(0.0)
+                self.particles[0, i_p, i_b].C = qd.Matrix.zero(gs.qd_float, 3, 3)
                 self.particles[0, i_p, i_b].Jp = self.particles_info[i_p].default_Jp
 
     @qd.kernel

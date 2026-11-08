@@ -259,6 +259,7 @@ class SAPCoupler(RBC):
             )
 
         self._rigid_compliant = False
+        self._has_equality_constraints = False
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
@@ -371,8 +372,12 @@ class SAPCoupler(RBC):
                 self.rigid_rigid_tet_contact = RigidRigidTetContactHandler(self.sim)
                 self.contact_handlers.append(self.rigid_rigid_tet_contact)
 
+            # The rigid solver leaves its equality constraints to this coupler, unless constraints are disabled
             # TODO: Dynamically added constraints are not supported for now
-            if self.rigid_solver.n_equalities > 0:
+            self._has_equality_constraints = (
+                self.rigid_solver.n_equalities > 0 and not self.rigid_solver._options.disable_constraint
+            )
+            if self._has_equality_constraints:
                 self._init_equality_constraint()
 
         if self._enable_rigid_fem_contact:
@@ -713,9 +718,7 @@ class SAPCoupler(RBC):
                     )
             gs.raise_exception(message)
         self.compute_regularization(
-            dofs_state=self.rigid_solver.dyn_state.dofs,
-            entities_info=self.rigid_solver.dyn_info.entities,
-            rigid_info=self.rigid_solver.rigid_info,
+            self.rigid_solver.dyn_info.entities, self.rigid_solver.dyn_info.equalities, self.rigid_solver.rigid_info
         )
 
     def precompute(self, i_step):
@@ -774,7 +777,8 @@ class SAPCoupler(RBC):
         return has_contact, overflow
 
     def couple(self, i_step):
-        if self.has_contact:
+        # Equality constraints bind the rigid dofs whether anything is in contact or not
+        if self.has_contact or self._has_equality_constraints:
             self.sap_solve(i_step)
             self.update_vel(i_step, dofs_state=self.rigid_solver.dyn_state.dofs)
 
@@ -798,7 +802,7 @@ class SAPCoupler(RBC):
     @qd.kernel
     def fem_compute_pressure_gradient(self, i_step: qd.i32):
         for i_b, i_e in qd.ndrange(self.fem_solver._B, self.fem_solver.n_elements):
-            self.fem_pressure_gradient[i_b, i_e].fill(0.0)
+            self.fem_pressure_gradient[i_b, i_e] = qd.Vector.zero(gs.qd_float, 3)
 
             for i in qd.static(range(4)):
                 i_v0 = self.fem_solver.elements_i[i_e].el2v[i]
@@ -975,16 +979,19 @@ class SAPCoupler(RBC):
             self.batch_active[i_b] = self.sap_state[i_b].gradient_norm >= norm_thr
 
     @qd.kernel
-    def compute_regularization(self, dofs_state: DofsState, entities_info: EntitiesInfo, rigid_info: RigidInfo):
+    def compute_regularization(
+        self, entities_info: EntitiesInfo, equalities_info: EqualitiesInfo, rigid_info: RigidInfo
+    ):
         for contact in qd.static(self.contact_handlers):
             contact.compute_regularization(entities_info=entities_info, rigid_info=rigid_info)
-        if qd.static(self.rigid_solver.is_active and self.rigid_solver.n_equalities > 0):
-            self.equality_constraint_handler.compute_regularization(dofs_state=dofs_state)
+        if qd.static(self._has_equality_constraints):
+            self.equality_constraint_handler.compute_regularization(entities_info, equalities_info, rigid_info)
 
     @qd.kernel
     def _init_sap_solve(self, i_step: qd.i32, dofs_state: DofsState):
         self._init_v(i_step, dofs_state=dofs_state)
-        self.batch_active.fill(True)
+        for i_b in range(self._B):
+            self.batch_active[i_b] = True
 
     @qd.func
     def _init_v(self, i_step: qd.i32, dofs_state: DofsState):
@@ -1019,7 +1026,7 @@ class SAPCoupler(RBC):
     def init_fem_unconstrained_gradient_diag(self, i_step: qd.i32):
         dt2 = self.fem_solver._substep_dt**2
         for i_b, i_v in qd.ndrange(self.fem_solver._B, self.fem_solver.n_vertices):
-            self.fem_state_v.gradient[i_b, i_v].fill(0.0)
+            self.fem_state_v.gradient[i_b, i_v] = qd.Vector.zero(gs.qd_float, 3)
             # was using position now using velocity, need to multiply dt^2
             self.pcg_fem_state_v[i_b, i_v].diag3x3 = self.fem_solver.pcg_state_v[i_b, i_v].diag3x3 * dt2
             self.fem_state_v.v_diff[i_b, i_v] = (
@@ -1044,7 +1051,6 @@ class SAPCoupler(RBC):
 
     @qd.kernel
     def compute_rigid_unconstrained_gradient(self, rigid_info: RigidInfo):
-        self.pcg_rigid_state_dof.Ap.fill(0.0)
         for i_b, i_d0, i_d1 in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_dofs, self.rigid_solver.n_dofs):
             if not self.batch_active[i_b]:
                 continue
@@ -1055,7 +1061,7 @@ class SAPCoupler(RBC):
     @qd.kernel
     def compute_constraint_contact_gradient_hessian_diag_prec(self):
         self.clear_impulses()
-        if qd.static(self.rigid_solver.is_active and self.rigid_solver.n_equalities > 0):
+        if qd.static(self._has_equality_constraints):
             self.equality_constraint_handler.compute_gradient_hessian_diag()
         for contact in qd.static(self.contact_handlers):
             contact.compute_gradient_hessian_diag()
@@ -1073,7 +1079,7 @@ class SAPCoupler(RBC):
         for i_b, i_v in qd.ndrange(self.fem_solver._B, self.fem_solver.n_vertices):
             if not self.batch_active[i_b]:
                 continue
-            self.fem_state_v[i_b, i_v].impulse.fill(0.0)
+            self.fem_state_v[i_b, i_v].impulse = qd.Vector.zero(gs.qd_float, 3)
 
     @qd.func
     def clear_rigid_impulses(self):
@@ -1178,11 +1184,12 @@ class SAPCoupler(RBC):
         """
         Compute the rigid mass matrix-vector product.
         """
-        out.fill(0.0)
-        for i_b, i_d0, i_d1 in qd.ndrange(self._B, self.rigid_solver.n_dofs, self.rigid_solver.n_dofs):
-            if not active[i_b]:
-                continue
-            out[i_b, i_d1] += rigid_info.mass_mat[i_d1, i_d0, i_b] * vec[i_b, i_d0]
+        for i_b, i_d1 in qd.ndrange(self._B, self.rigid_solver.n_dofs):
+            prod = gs.qd_float(0.0)
+            if active[i_b]:
+                for i_d0 in range(self.rigid_solver.n_dofs):
+                    prod = prod + rigid_info.mass_mat[i_d1, i_d0, i_b] * vec[i_b, i_d0]
+            out[i_b, i_d1] = prod
 
     # FIXME: This following two rigid solves are duplicated with the one in rigid_solver.py:func_solve_mass_batched
     # Consider refactoring.
@@ -1300,7 +1307,7 @@ class SAPCoupler(RBC):
         if qd.static(self.rigid_solver.is_active):
             self.compute_rigid_pcg_matrix_vector_product(rigid_info=rigid_info)
         # Constraint
-        if qd.static(self.rigid_solver.is_active and self.rigid_solver.n_equalities > 0):
+        if qd.static(self._has_equality_constraints):
             self.equality_constraint_handler.compute_Ap()
         # Contact
         for contact in qd.static(self.contact_handlers):
@@ -1441,13 +1448,14 @@ class SAPCoupler(RBC):
 
     @qd.func
     def compute_total_energy(self, i_step: qd.i32, energy: qd.template(), dofs_state: DofsState, rigid_info: RigidInfo):
-        energy.fill(0.0)
+        for i_b in range(self._B):
+            energy[i_b] = 0.0
         if qd.static(self.fem_solver.is_active):
             self.compute_fem_energy(i_step, energy)
         if qd.static(self.rigid_solver.is_active):
             self.compute_rigid_energy(energy, dofs_state=dofs_state, rigid_info=rigid_info)
         # Constraint
-        if qd.static(self.rigid_solver.is_active and self.rigid_solver.n_equalities > 0):
+        if qd.static(self._has_equality_constraints):
             self.equality_constraint_handler.compute_energy(energy)
         # Contact
         for contact in qd.static(self.contact_handlers):
@@ -1563,7 +1571,7 @@ class SAPCoupler(RBC):
             self.compute_rigid_energy_alpha(self.linesearch_state.energy, dofs_state=dofs_state)
             self.compute_rigid_gradient_alpha(dofs_state=dofs_state)
         # Constraint
-        if qd.static(self.rigid_solver.is_active and self.rigid_solver.n_equalities > 0):
+        if qd.static(self._has_equality_constraints):
             self.equality_constraint_handler.compute_energy_gamma_G()
             self.equality_constraint_handler.update_gradient_hessian_alpha()
         # Contact
@@ -1640,7 +1648,7 @@ class SAPCoupler(RBC):
         if qd.static(self.rigid_solver.is_active):
             self.prepare_rigid_search_direction_data(rigid_info=rigid_info)
         # Constraint
-        if qd.static(self.rigid_solver.is_active and self.rigid_solver.n_equalities > 0):
+        if qd.static(self._has_equality_constraints):
             self.equality_constraint_handler.prepare_search_direction_data()
         # Contact
         for contact in qd.static(self.contact_handlers):
@@ -1904,8 +1912,11 @@ class BaseConstraintHandler(RBC):
 
     def __init__(self, simulator: "Simulator", stiffness: float = 1e8, beta: float = 0.1) -> None:
         self.sim = simulator
-        self.stiffness = stiffness
-        self.beta = beta
+        self.stiffness = qd.field(gs.qd_float, shape=())
+        self.stiffness[None] = stiffness
+        # Near-rigid threshold of SAP: the regularization keeps the period of a constraint above beta time steps
+        self.beta = qd.field(gs.qd_float, shape=())
+        self.beta[None] = beta
         self._B = simulator._B
         self.coupler = simulator.coupler
         self.sap_constraint_info_type = qd.types.struct(
@@ -1921,7 +1932,7 @@ class BaseConstraintHandler(RBC):
 
     @qd.func
     def compute_constraint_regularization(self, sap_info, i_c, w_rms, time_step):
-        beta_factor = self.beta**2 / (4.0 * qd.math.pi**2)
+        beta_factor = self.beta[None] ** 2 / (4.0 * qd.math.pi**2)
         dt2 = time_step**2
         k = sap_info[i_c].k
         R = max(beta_factor * w_rms, 1.0 / (dt2 * k))
@@ -1965,14 +1976,20 @@ class RigidConstraintHandler(BaseConstraintHandler):
         self.n_constraints = qd.field(gs.qd_int, shape=())
         self.constraint_type = qd.types.struct(
             batch_idx=gs.qd_int,  # batch index
+            i_eq=gs.qd_int,  # index of the equality constraint
             i_dof1=gs.qd_int,  # index of the first DOF in the constraint
             i_dof2=gs.qd_int,  # index of the second DOF in the constraint
+            i_qpos1=gs.qd_int,  # index of the first joint position
+            i_qpos2=gs.qd_int,  # index of the second joint position
+            jac_dof2=gs.qd_float,  # Jacobian entry of the second DOF, the first one being 1
             sap_info=self.sap_constraint_info_type,  # SAP info for the constraint
         )
         self.constraints = self.constraint_type.field(shape=(self.max_constraints,))
-        self.Jt = qd.field(gs.qd_float, shape=(self.max_constraints, self.rigid_solver.n_dofs_))
-        self.M_inv_Jt = qd.field(gs.qd_float, shape=(self.max_constraints, self.rigid_solver.n_dofs_))
-        self.W = qd.field(gs.qd_float, shape=(self.max_constraints,))
+        # Vectors of size one, as the rigid Jacobian solve shared with the contact handlers indexes each component
+        self.Jt = qd.field(qd.types.vector(1, gs.qd_float), shape=(self.max_constraints, self.rigid_solver.n_dofs_))
+        self.M_inv_Jt = qd.field(
+            qd.types.vector(1, gs.qd_float), shape=(self.max_constraints, self.rigid_solver.n_dofs_)
+        )
 
     @qd.kernel
     def build_constraints(self, equalities_info: EqualitiesInfo, joints_info: JointsInfo, rigid_config: qd.template()):
@@ -1996,61 +2013,69 @@ class RigidConstraintHandler(BaseConstraintHandler):
                     else equalities_info.eq_obj2id[i_e, i_b]
                 )
                 i_dof1 = joints_info.dof_start[I_joint1]
-                i_dof2 = joints_info.dof_start[I_joint2]
+                self.constraints[i_c].i_eq = i_e
                 self.constraints[i_c].i_dof1 = i_dof1
-                self.constraints[i_c].i_dof2 = i_dof2
-                self.constraints[i_c].sap_info.k = self.stiffness
-                self.constraints[i_c].sap_info.R_inv = dt2 * self.stiffness
+                self.constraints[i_c].i_dof2 = joints_info.dof_start[I_joint2]
+                self.constraints[i_c].i_qpos1 = joints_info.q_start[I_joint1]
+                self.constraints[i_c].i_qpos2 = joints_info.q_start[I_joint2]
+                self.constraints[i_c].sap_info.k = self.stiffness[None]
+                self.constraints[i_c].sap_info.R_inv = dt2 * self.stiffness[None]
                 self.constraints[i_c].sap_info.R = 1.0 / self.constraints[i_c].sap_info.R_inv
                 self.constraints[i_c].sap_info.v_hat = 0.0
-                self.Jt[i_c, i_dof1] = 1.0
-                self.Jt[i_c, i_dof2] = -1.0
+                self.Jt[i_c, i_dof1] = qd.Vector([1.0])
 
     @qd.func
-    def compute_regularization(self, dofs_state: DofsState):
+    def compute_regularization(
+        self, entities_info: EntitiesInfo, equalities_info: EqualitiesInfo, rigid_info: RigidInfo
+    ):
+        # The constraint q1 - q1_0 = poly(q2 - q2_0) of the polynomial coefficients 'eq_data', linearized at the current
+        # joint positions as the rigid constraint solver does, so its Jacobian is [1, -poly'(q2 - q2_0)].
         dt_inv = 1.0 / self.sim._substep_dt
-        q = qd.static(dofs_state.pos)
         sap_info = qd.static(self.constraints.sap_info)
         for i_c in range(self.n_constraints[None]):
             i_b = self.constraints[i_c].batch_idx
-            g0 = q[self.constraints[i_c].i_dof1, i_b] - q[self.constraints[i_c].i_dof2, i_b]
+            i_e = self.constraints[i_c].i_eq
+            i_qpos1 = self.constraints[i_c].i_qpos1
+            i_qpos2 = self.constraints[i_c].i_qpos2
+            pos = rigid_info.qpos[i_qpos1, i_b] - rigid_info.qpos0[i_qpos1, i_b]
+            diff = rigid_info.qpos[i_qpos2, i_b] - rigid_info.qpos0[i_qpos2, i_b]
+            g0, deriv = gu.joint_equality_residual(pos, diff, equalities_info.eq_data[i_e, i_b])
+            i_dof2 = self.constraints[i_c].i_dof2
+            self.constraints[i_c].jac_dof2 = -deriv
+            self.Jt[i_c, i_dof2] = qd.Vector([-deriv])
             self.constraints[i_c].sap_info.v_hat = -g0 * dt_inv
-            W = self.compute_delassus(i_c)
-            self.compute_constraint_regularization(sap_info, i_c, W, self.sim._substep_dt)
 
-    @qd.func
-    def compute_delassus_world_frame(self, entities_info: EntitiesInfo, rigid_info: RigidInfo):
         self.coupler.rigid_solve_jacobian(
             self.Jt,
             self.M_inv_Jt,
             self.n_constraints[None],
             self.constraints.batch_idx,
-            1,
+            dim=1,
             entities_info=entities_info,
             rigid_info=rigid_info,
         )
-        self.W.fill(0.0)
-        for i_c, i_d in qd.ndrange(self.n_constraints[None], self.rigid_solver.n_dofs):
-            self.W[i_c] += self.M_inv_Jt[i_c, i_d] * self.Jt[i_c, i_d]
 
-    @qd.func
-    def compute_delassus(self, i_c):
-        return self.W[i_c]
+        for i_c in range(self.n_constraints[None]):
+            # Delassus operator J @ M^-1 @ J^T
+            i_dof1 = self.constraints[i_c].i_dof1
+            i_dof2 = self.constraints[i_c].i_dof2
+            W = self.M_inv_Jt[i_c, i_dof1][0] + self.constraints[i_c].jac_dof2 * self.M_inv_Jt[i_c, i_dof2][0]
+            self.compute_constraint_regularization(sap_info, i_c, W, self.sim._substep_dt)
 
     @qd.func
     def compute_Jx(self, i_c, x):
         i_b = self.constraints[i_c].batch_idx
         i_dof1 = self.constraints[i_c].i_dof1
         i_dof2 = self.constraints[i_c].i_dof2
-        return x[i_b, i_dof1] - x[i_b, i_dof2]
+        return x[i_b, i_dof1] + self.constraints[i_c].jac_dof2 * x[i_b, i_dof2]
 
     @qd.func
     def add_Jt_x(self, y, i_c, x):
         i_b = self.constraints[i_c].batch_idx
         i_dof1 = self.constraints[i_c].i_dof1
         i_dof2 = self.constraints[i_c].i_dof2
-        y[i_b, i_dof1] += x
-        y[i_b, i_dof2] -= x
+        qd.atomic_add(y[i_b, i_dof1], x)
+        qd.atomic_add(y[i_b, i_dof2], self.constraints[i_c].jac_dof2 * x)
 
     @qd.func
     def compute_vc(self, i_c):
@@ -2200,8 +2225,8 @@ class BaseContactHandler(RBC):
 
         t_hat = y[:2] / yr
         contact_mode = self.compute_contact_mode(sap_info[i_p].mu, sap_info[i_p].mu_hat, yr, yn)
-        sap_info[i_p].gamma.fill(0.0)
-        sap_info[i_p].G.fill(0.0)
+        sap_info[i_p].gamma = qd.Vector.zero(gs.qd_float, 3)
+        sap_info[i_p].G = qd.Matrix.zero(gs.qd_float, 3, 3)
         if contact_mode == ContactMode.STICK:
             sap_info[i_p].gamma = y
             sap_info[i_p].G[0, 0] = sap_info[i_p].Rt_inv
@@ -2245,7 +2270,7 @@ class BaseContactHandler(RBC):
 
         t_hat = y[:2] / yr
         contact_mode = self.compute_contact_mode(sap_info[i_p].mu, sap_info[i_p].mu_hat, yr, yn)
-        sap_info[i_p].gamma.fill(0.0)
+        sap_info[i_p].gamma = qd.Vector.zero(gs.qd_float, 3)
         if contact_mode == ContactMode.STICK:
             sap_info[i_p].gamma = y
         elif contact_mode == ContactMode.SLIDE:
@@ -2299,10 +2324,11 @@ class RigidContactHandler(BaseContactHandler):
     # Consider refactoring, using better naming, and removing while.
     @qd.func
     def compute_jacobian(self, links_info: LinksInfo, dofs_state: DofsState, links_state: LinksState):
-        self.Jt.fill(0.0)
         for i_p in range(self.n_contact_pairs[None]):
             link = self.contact_pairs[i_p].link_idx
             i_b = self.contact_pairs[i_p].batch_idx
+            for i_d in range(self.rigid_solver.n_dofs):
+                self.Jt[i_p, i_d] = qd.Vector.zero(gs.qd_float, 3)
             while link > -1:
                 link_maybe_batch = [link, i_b] if qd.static(self.rigid_solver._options.batch_links_info) else link
                 # reverse order to make sure dofs in each row of self.jac_dofs_idx is strictly descending
@@ -2365,9 +2391,11 @@ class RigidContactHandler(BaseContactHandler):
             entities_info=entities_info,
             rigid_info=rigid_info,
         )
-        self.W.fill(0.0)
-        for i_p, i_d, i, j in qd.ndrange(self.n_contact_pairs[None], self.rigid_solver.n_dofs, 3, 3):
-            self.W[i_p][i, j] += self.M_inv_Jt[i_p, i_d][i] * self.Jt[i_p, i_d][j]
+        for i_p in range(self.n_contact_pairs[None]):
+            W = qd.Matrix.zero(gs.qd_float, 3, 3)
+            for i_d in range(self.rigid_solver.n_dofs):
+                W = W + self.M_inv_Jt[i_p, i_d].outer_product(self.Jt[i_p, i_d])
+            self.W[i_p] = W
 
     @qd.func
     def compute_delassus(self, i_p):
@@ -2397,10 +2425,11 @@ class RigidRigidContactHandler(RigidContactHandler):
 
     @qd.func
     def compute_jacobian(self, links_info: LinksInfo, dofs_state: DofsState, links_state: LinksState):
-        self.Jt.fill(0.0)
         pairs = qd.static(self.contact_pairs)
         for i_p in range(self.n_contact_pairs[None]):
             i_b = pairs[i_p].batch_idx
+            for i_d in range(self.rigid_solver.n_dofs):
+                self.Jt[i_p, i_d] = qd.Vector.zero(gs.qd_float, 3)
             link = pairs[i_p].link_idx0
             while link > -1:
                 link_maybe_batch = [link, i_b] if qd.static(self.rigid_solver._options.batch_links_info) else link
@@ -3677,27 +3706,17 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
     def compute_delassus_world_frame(self, entities_info: EntitiesInfo, rigid_info: RigidInfo):
         dt2_inv = 1.0 / self.sim._substep_dt**2
         # rigid
-        self.coupler.rigid_solve_jacobian(
-            self.Jt,
-            self.M_inv_Jt,
-            self.n_contact_pairs[None],
-            self.contact_pairs.batch_idx,
-            3,
-            entities_info=entities_info,
-            rigid_info=rigid_info,
-        )
-        self.W.fill(0.0)
-        for i_p, i_d, i, j in qd.ndrange(self.n_contact_pairs[None], self.rigid_solver.n_dofs, 3, 3):
-            self.W[i_p][i, j] += self.M_inv_Jt[i_p, i_d][i] * self.Jt[i_p, i_d][j]
-
+        RigidContactHandler.compute_delassus_world_frame(self, entities_info, rigid_info)
         # fem
         barycentric0 = qd.static(self.contact_pairs.barycentric0)
         for i_p in range(self.n_contact_pairs[None]):
             i_g0 = self.contact_pairs[i_p].geom_idx0
             i_b = self.contact_pairs[i_p].batch_idx
+            W = self.W[i_p]
             for i in qd.static(range(4)):
                 i_v = self.fem_solver.elements_i[i_g0].el2v[i]
-                self.W[i_p] += barycentric0[i_p][i] ** 2 * dt2_inv * self.fem_solver.pcg_state_v[i_b, i_v].prec
+                W = W + barycentric0[i_p][i] ** 2 * dt2_inv * self.fem_solver.pcg_state_v[i_b, i_v].prec
+            self.W[i_p] = W
 
     @qd.func
     def compute_delassus(self, i_p):

@@ -49,9 +49,9 @@ def func_gjk_contact(
 
     - Local position of the three vertices from the two geometries that form the face on the Minkowski difference.
     - Local position of the single vertex from the two geometries that form the support point for the face above.
-    - Validity of the contact point (i.e., the face is not degenerate and the origin is not very close to the face). The
-    contact point is valid only when the differentiable contact data can be computed in numerically stable way in both
-    the forward and backward passes.
+    - Validity of the contact point (i.e., the face is not degenerate and the projection of the origin falls within the
+    face). The contact point is valid only when the differentiable contact data can be computed in numerically stable
+    way in both the forward and backward passes, and when it lies on both geometries.
 
     Then, for each of the valid contact points, we compute the differentiable contact data as follows:
 
@@ -63,7 +63,6 @@ def func_gjk_contact(
     Note that these terms can be computed from the non-differentiable contact data in a differentiable way. Therefore,
     we store the non-differentiable contact data along with the differentiable contact data for the backward pass.
     """
-    EPS = rigid_info.EPS[None]
 
     # Clear the cache to prepare for this GJK-EPA run.
     GJK.clear_cache(i_b, gjk_state)
@@ -88,7 +87,7 @@ def func_gjk_contact(
     # 4 (small) + 4 (large) perturbated configurations
     num_perturb = 8
 
-    ### Detect multiple possible contact points and gather the non-differentiable contact data.
+    # Detect multiple possible contact points and gather the non-differentiable contact data.
     for i in range(1 + num_perturb):
         # First iteration: Detect contact in default configuration.
         # 2,3,4,5: Detect contacts in slightly perturbed configuration.
@@ -104,7 +103,7 @@ def func_gjk_contact(
             # otherwise it would be more sensitive to ill-conditionning.
             axis = (2 * (i % 2) - 1) * axis_0 + (1 - 2 * ((i // 2) % 2)) * axis_1
             rotang = 1e-2 * (100 ** ((i - 1) // 4))
-            qrot = gu.qd_rotvec_to_quat(rotang * axis, EPS)
+            qrot = gu.qd_rotvec_to_quat(rotang * axis)
 
             # Apply perturbation to local variables
             ga_pos_local, ga_quat_local = contact.func_rotate_frame(
@@ -202,16 +201,28 @@ def func_gjk_contact(
                         collider_config,
                     )
 
+                    # The faces coplanar with the deepest one tie with it, and only the one holding the projection of
+                    # the origin yields a contact on both geometries, so an invalid face gives way to the next one.
+                    i_c_added = gjk_state.n_diff_contact_input[i_b] - 1
+                    if gjk_state.diff_contact_input.valid[i_c_added, i_b] == 0:
+                        gjk_state.n_diff_contact_input[i_b] = i_c_added
+                        continue
+
                     if not found_default_epa:
-                        # If the default contact is already numerically unstable, we do not add any contact point.
-                        if gjk_state.diff_contact_input.valid[0, i_b] == 0:
-                            gjk_state.n_diff_contact_input[i_b] = 0
-                            break
                         default_contact_pos = 0.5 * (witness1 + witness2)
                         default_penetration = penetration
 
+                        # The witness points coincide at zero penetration, so the axes follow the face, whose outward
+                        # normal points against the contact normal.
                         axis_0, axis_1 = func_contact_orthogonals(
-                            i_ga, i_gb, i_b, normal / penetration, geoms_init_AABB, dyn_state, dyn_info, rigid_info
+                            i_ga,
+                            i_gb,
+                            i_b,
+                            -gjk_state.polytope_faces.normal[i_f, i_b],
+                            geoms_init_AABB,
+                            dyn_state,
+                            dyn_info,
+                            rigid_info,
                         )
 
                         found_default_epa = True
@@ -269,7 +280,7 @@ def func_gjk_contact(
             # If there was no intersection at the default configuration, we do not add any contact point.
             break
 
-    ### Compute the differentiable contact data from the non-differentiable data.
+    # Compute the differentiable contact data from the non-differentiable data.
     n_contacts = 0
     for i_c in range(gjk_state.n_diff_contact_input[i_b]):
         # We ignore the contact point if it is not numerically stable.
@@ -613,26 +624,33 @@ def func_add_diff_contact_input(
         elif i == 2:
             mink3 = mink
 
-    ### Check validity of this contact. The contact is valid if the contact information could be computed in numerically
-    ### stable way in both the forward and backward pass.
+    # Check validity of this contact. The contact is valid if the contact information could be computed in numerically
+    # stable way in both the forward and backward pass.
     # (a) Check if the face is degenerate.
     normal = func_plane_normal(mink1, mink2, mink3)
     normal_norm = normal.norm()
     is_face_degenerate = normal_norm < collider_info.gjk.diff_contact_min_normal_norm[None]
 
-    # (b) Check if the origin is very close to the face (which means very small penetration depth).
-    proj_o = func_project_origin_to_plane(mink1, mink2, mink3, normal)
-    origin_dist = proj_o.norm()
-    is_origin_close_to_face = origin_dist < collider_info.gjk.diff_contact_min_penetration[None]
+    # (b) Check if the projection of the origin falls within the face. Outside of it, its affine coordinates extrapolate
+    # the witness points beyond both geometries.
+    is_origin_outside_face = False
+    if not is_face_degenerate:
+        proj_o = func_project_origin_to_plane(mink1, mink2, mink3, normal)
+        affine_coords = func_triangle_affine_coords(mink1, mink2, mink3, normal, proj_o)
+        is_origin_outside_face = affine_coords.min() < -collider_info.gjk.diff_contact_eps_affine[None]
 
-    ### Orient the face normal, so that it points to the other side of the origin.
-    face_center = (mink1 + mink2 + mink3) / 3.0
+    # The face is wound so that its normal points outward, as EPA oriented it from the whole polytope, the face plane
+    # holding the origin at zero penetration and leaving its center no side to tell. The differentiable contact reads
+    # the orientation from the winding of the vertices stored below.
+    if normal.dot(gjk_state.polytope_faces.normal[i_f, i_b]) < 0.0:
+        i_v_swap = i_v2
+        i_v2 = i_v3
+        i_v3 = i_v_swap
+        normal = -normal
     if normal_norm > collider_info.gjk.FLOAT_MIN[None]:
         normal = normal.normalized()
-    if normal.dot(face_center) < 0.0:
-        normal = -normal
 
-    ### Compute the support point along the face normal.
+    # Compute the support point along the face normal.
     obj1, obj2, localpos1, localpos2, id1, id2, mink = GJK.func_support(
         i_ga,
         i_gb,
@@ -659,7 +677,7 @@ def func_add_diff_contact_input(
     gjk_state.diff_contact_input.local_pos2_c[n, i_b] = gjk_state.polytope_verts.local_obj2[i_v3, i_b]
     gjk_state.diff_contact_input.w_local_pos1[n, i_b] = localpos1
     gjk_state.diff_contact_input.w_local_pos2[n, i_b] = localpos2
-    gjk_state.diff_contact_input.valid[n, i_b] = not (is_face_degenerate or is_origin_close_to_face)
+    gjk_state.diff_contact_input.valid[n, i_b] = not (is_face_degenerate or is_origin_outside_face)
     gjk_state.n_diff_contact_input[i_b] += 1
 
 
@@ -782,7 +800,7 @@ def func_differentiable_contact(
     mink3 = pos1c - pos2c
     face_center = (mink1 + mink2 + mink3) / 3.0
 
-    ### Compute the witness points on the two geometries.
+    # Compute the witness points on the two geometries.
     # Compute the normal of the face
     normal = func_plane_normal(mink1, mink2, mink3)
 
@@ -800,19 +818,16 @@ def func_differentiable_contact(
     # Point on geom 2
     w2 = pos2a * _lambda[0] + pos2b * _lambda[1] + pos2c * _lambda[2]
 
-    ### Compute contact position, normal, and penetration depth. These operations are guaranteed to be numerically stable,
-    ### especially the normalization of the contact normal, as the penetration depth is guaranteed to be larger than the
-    ### minimum penetration depth in [gjk_info].
+    # The normal and the depth come from the face plane: the difference of the witness points, which is the projection
+    # of the origin onto the face, vanishes with the depth and cannot be normalized. The winding of the stored vertices
+    # makes the normal point outward (see func_add_diff_contact_input).
+    face_normal = normal.normalized()
+
     contact_pos = 0.5 * (w1 + w2)
-    contact_normal = (w2 - w1).normalized()
-    penetration = (w2 - w1).norm()
+    contact_normal = -face_normal
+    penetration = qd.max(face_normal.dot(face_center), 0.0)
 
-    ### Compute weight of the contact point.
-    face_normal = normal
-    if normal.dot(face_center) < 0.0:
-        face_normal = -normal
-    face_normal = face_normal.normalized()
-
+    # Compute weight of the contact point.
     w_pos1 = gu.qd_transform_by_trans_quat(w_local_pos1, trans1, quat1)
     w_pos2 = gu.qd_transform_by_trans_quat(w_local_pos2, trans2, quat2)
     w = w_pos1 - w_pos2
@@ -826,16 +841,8 @@ def func_differentiable_contact(
     if ref_penetration >= 0.0:
         distance_weight = 1.0 - qd.math.clamp((penetration - ref_penetration) / eps_D, 0.0, 1.0)
 
-    # Affine weight: Theoretically we need this, but in practice it could cause instability
-    # FIXME: Can we stabilize it?
-    # affine_weight_0 = 1.0 - qd.math.clamp(qd.max(0.0 - _lambda[0], _lambda[0] - 1.0) / eps_A, 0.0, 1.0)
-    # affine_weight_1 = 1.0 - qd.math.clamp(qd.max(0.0 - _lambda[1], _lambda[1] - 1.0) / eps_A, 0.0, 1.0)
-    # affine_weight_2 = 1.0 - qd.math.clamp(qd.max(0.0 - _lambda[2], _lambda[2] - 1.0) / eps_A, 0.0, 1.0)
-    # affine_weight = (affine_weight_0 + affine_weight_1 + affine_weight_2) / 3.0
-    affine_weight = 1.0
-
-    # Compute final weight
-    weight = affine_weight * distance_weight * boundary_weight
+    # A face whose projection of the origin falls outside of it is rejected beforehand (see func_add_diff_contact_input)
+    weight = distance_weight * boundary_weight
 
     return contact_pos, contact_normal, penetration, weight
 

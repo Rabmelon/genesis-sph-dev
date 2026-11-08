@@ -233,7 +233,7 @@ def func_COM_root_sum(
     EPS = rigid_info.EPS[None]
     i_l_end = rigid_info.links_root_end[i_l_root]
 
-    dyn_state.links.root_COM_bw[i_l_root, i_b].fill(0.0)
+    dyn_state.links.root_COM_bw[i_l_root, i_b] = qd.Vector.zero(gs.qd_float, 3)
     dyn_state.links.mass_sum[i_l_root, i_b] = 0.0
     # The walk covers the link span of the root and gates each link on its root (see roots_link_idx in array_class.py),
     # so a root spanning several entities, one attached beneath another, sums every link of its own before it divides
@@ -491,7 +491,7 @@ def func_forward_kinematics_link(
         elif joint_type == gs.JOINT_TYPE.REVOLUTE:
             axis = dyn_info.dofs.motion_ang[I_d]
             dyn_state.dofs.pos[dof_start, i_b] = qpos[q_start, i_b] - rigid_info.qpos0[q_start, i_b]
-            qloc = gu.qd_rotvec_to_quat(axis * dyn_state.dofs.pos[dof_start, i_b], rigid_info.EPS[None])
+            qloc = gu.qd_rotvec_to_quat(axis * dyn_state.dofs.pos[dof_start, i_b])
             quat_ = gu.qd_transform_quat_by_quat(qloc, R(curr_I, quat, dyn_state.links.quat_bw, BW))
             quat = WR(next_I, quat_, dyn_state.links.quat_bw, BW)
             pos_ = dyn_state.joints.xanchor[i_j, i_b] - gu.qd_transform_by_quat(dyn_info.joints.pos[I_j], quat)
