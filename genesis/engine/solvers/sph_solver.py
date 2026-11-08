@@ -508,7 +508,7 @@ class SPHSolver(ParticleSolver):
         ret.acc += mass_j * ((self.particles_reordered[i, i_b].sigma / rho_i**2 + sigma_j / rho_j**2) @ grad_w)
 
     @qd.kernel
-    def _kernel_compute_stress_forces(self, f: qd.i32, wall_friction: qd.f32):
+    def _kernel_compute_stress_forces(self, f: qd.i32, wall_friction: float):
         for i_p, i_b in qd.ndrange(self._n_particles_total, self._B):
             is_simulated = self.particles_ng_reordered[i_p, i_b].active
             if qd.static(self._has_boundary_particles):
@@ -1240,7 +1240,7 @@ class SPHSolver(ParticleSolver):
         f: qd.i32,
         particle_start: qd.i32,
         n_particles: qd.i32,
-        mat_rho: qd.f32,
+        mat_rho: float,
         pos: qd.types.ndarray(),
         normal: qd.types.ndarray(),
     ):
